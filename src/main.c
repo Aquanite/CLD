@@ -38,8 +38,16 @@ static void cld_print_version(FILE *stream) {
 
 static void cld_print_usage(FILE *stream) {
     fprintf(stream,
-            "usage: cld link <input> [more inputs ...] -o <output> [--target <target>] [--output-kind <kind>] [--entry <symbol>] [--stack-size <bytes>] [-nostdlib] [--list-targets]\n");
+            "usage: cld link <input> [more inputs ...] -o <output> [--target <target>] [--output-kind <kind>] [--entry <symbol>] [--stack-size <bytes>] [-nostdlib] [--list-targets] [-d|-vd]\n");
     fprintf(stream, "       output kinds: relocatable, executable\n");
+}
+
+static void cld_print_debug_header(void) {
+    fprintf(stderr, "\n[debug] Configuration\n");
+}
+
+static void cld_print_debug_row(const char *key, const char *value) {
+    fprintf(stderr, "  %-16s : %s\n", key, value ? value : "-");
 }
 
 int main(int argc, char **argv) {
@@ -50,6 +58,8 @@ int main(int argc, char **argv) {
     size_t input_count;
     size_t parsed_object_count;
     bool entry_symbol_explicit;
+    bool debug_enabled;
+    bool debug_deep;
     int argument_index;
 
     object_files = NULL;
@@ -57,6 +67,8 @@ int main(int argc, char **argv) {
     input_count = 0;
     parsed_object_count = 0;
     entry_symbol_explicit = false;
+    debug_enabled = false;
+    debug_deep = false;
     memset(&options, 0, sizeof(options));
     memset(&error, 0, sizeof(error));
 
@@ -80,6 +92,15 @@ int main(int argc, char **argv) {
     if (input_paths == NULL) {
         fprintf(stderr, "cld: out of memory allocating input list\n");
         return 1;
+    }
+
+    for (argument_index = 2; argument_index < argc; ++argument_index) {
+        if (strcmp(argv[argument_index], "-d") == 0 || strcmp(argv[argument_index], "--debug") == 0) {
+            debug_enabled = true;
+        } else if (strcmp(argv[argument_index], "-vd") == 0 || strcmp(argv[argument_index], "--verbose-deep") == 0) {
+            debug_enabled = true;
+            debug_deep = true;
+        }
     }
 
     for (argument_index = 2; argument_index < argc; ++argument_index) {
@@ -139,9 +160,19 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[argument_index], "-nostdlib") == 0) {
             options.no_stdlib = true;
         } else if (strcmp(argv[argument_index], "--list-targets") == 0) {
+            if (debug_enabled) {
+                cld_print_debug_header();
+                cld_print_debug_row("Action", "list-targets");
+                cld_print_debug_row("Deep mode", debug_deep ? "enabled" : "disabled");
+            }
             cld_print_targets(stdout);
             free(input_paths);
             return 0;
+        } else if (strcmp(argv[argument_index], "-d") == 0 || strcmp(argv[argument_index], "--debug") == 0) {
+            debug_enabled = true;
+        } else if (strcmp(argv[argument_index], "-vd") == 0 || strcmp(argv[argument_index], "--verbose-deep") == 0) {
+            debug_enabled = true;
+            debug_deep = true;
         } else if (argv[argument_index][0] == '-') {
             cld_print_usage(stderr);
             goto failure;
@@ -163,6 +194,24 @@ int main(int argc, char **argv) {
         fprintf(stderr,
                 "cld: warning: enabling -nostdlib by default because the current platform is not the target\n");
         options.no_stdlib = true;
+    }
+
+    if (debug_enabled) {
+        char input_count_buf[32];
+        snprintf(input_count_buf, sizeof(input_count_buf), "%zu", input_count);
+        cld_print_debug_header();
+        cld_print_debug_row("Target", options.target ? options.target->name : "-");
+        cld_print_debug_row("Output", options.output_path ? options.output_path : "-");
+        cld_print_debug_row("Output kind", cld_output_kind_name(options.output_kind));
+        cld_print_debug_row("Entry", options.entry_symbol ? options.entry_symbol : "-");
+        cld_print_debug_row("No stdlib", options.no_stdlib ? "yes" : "no");
+        cld_print_debug_row("Inputs", input_count_buf);
+        if (debug_deep) {
+            cld_print_debug_row("Deep mode", "enabled");
+            for (size_t i = 0; i < input_count; ++i) {
+                fprintf(stderr, "    input[%zu]         = %s\n", i, input_paths[i]);
+            }
+        }
     }
 
     object_files = calloc(input_count, sizeof(*object_files));
