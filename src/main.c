@@ -29,7 +29,7 @@ static void cld_print_targets(FILE *stream) {
 }
 
 static void cld_print_version(FILE *stream) {
-    fprintf(stream, "cld: CHance Loader/Linker version 0.5.0\n");
+    fprintf(stream, "cld: CHance Loader/Linker version 1.0.0\n");
     fprintf(stream, "cld: (no language standard)\n");
     fprintf(stream, "cld: License: OpenAzure License\n");
     fprintf(stream, "cld: Compiled on %s %s\n", __DATE__, __TIME__);
