@@ -10,9 +10,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
+#include <errno.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <dlfcn.h>
 
 extern char **environ;
 
@@ -64,7 +68,36 @@ typedef struct {
     size_t source_object_index;
     bool is_defined;
     bool include_in_output;
+    bool is_dynamic_import;
+    char *dynamic_import_dylib;
 } CldResolvedSymbol;
+
+typedef struct {
+    char **names;
+    size_t count;
+    size_t capacity;
+} CldSymbolNameSet;
+
+typedef struct {
+    char *symbol;
+    char *dylib;
+} CldImportCacheEntry;
+
+typedef struct {
+    CldImportCacheEntry *entries;
+    size_t count;
+    size_t capacity;
+} CldImportCache;
+
+#define CLD_MACOS_SDK_USR_LIB_DIR "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/lib"
+#define CLD_MACOS_SDK_TBD_CACHE_PATH "/tmp/cld_macos_sdk_tbd_cache_v1.txt"
+#define CLD_MACOS_SDK_TBD_CACHE_HEADER "CLD_TBD_CACHE_V1"
+#define CLD_STARTUP_PROLOGUE_SIZE 20u
+#define CLD_IMPORT_STUB_SIZE 16u
+#define CLD_IMPORT_STUB_CAPACITY 4096u
+#define CLD_ARM64_LDR_LITERAL_X16_PLUS8 0x58000050u
+#define CLD_ARM64_BR_X16 0xd61f0200u
+#define CLD_ARM64_B_IMM26_ZERO 0x14000000u
 
 typedef struct {
     uint32_t output_section_index;
@@ -224,216 +257,621 @@ static void cld_write_padded_command(uint8_t **cursor, const void *command, size
     *cursor += padded_size;
 }
 
-static bool cld_find_macos_libsystem_tbd(char **libsystem_path, CldError *error) {
-    static const char suffix[] = "/usr/lib/libSystem.B.tbd";
-    FILE *pipe_handle;
-    char sdk_path[4096];
-    size_t sdk_path_length;
-    size_t result_length;
-    char *resolved_path;
-    int close_status;
+static void cld_symbol_name_set_destroy(CldSymbolNameSet *set) {
+    if (set == NULL) {
+        return;
+    }
+    if (set->names != NULL) {
+        for (size_t i = 0; i < set->count; ++i) {
+            free(set->names[i]);
+        }
+    }
+    free(set->names);
+    set->names = NULL;
+    set->count = 0;
+    set->capacity = 0;
+}
 
-    *libsystem_path = NULL;
-    pipe_handle = popen("xcrun --show-sdk-path", "r");
-    if (pipe_handle == NULL) {
-        cld_set_error(error,
-                      "failed to run xcrun --show-sdk-path; install Xcode or the Command Line Tools");
-        return false;
+static void cld_import_cache_destroy(CldImportCache *cache) {
+    if (cache == NULL) {
+        return;
+    }
+    if (cache->entries != NULL) {
+        for (size_t i = 0; i < cache->count; ++i) {
+            free(cache->entries[i].symbol);
+            free(cache->entries[i].dylib);
+        }
+    }
+    free(cache->entries);
+    cache->entries = NULL;
+    cache->count = 0;
+    cache->capacity = 0;
+}
+
+static const char *cld_import_cache_lookup(const CldImportCache *cache,
+                                           const char *symbol) {
+    if (cache == NULL || symbol == NULL) {
+        return NULL;
+    }
+    for (size_t i = 0; i < cache->count; ++i) {
+        if (cache->entries[i].symbol != NULL &&
+            strcmp(cache->entries[i].symbol, symbol) == 0) {
+            return cache->entries[i].dylib;
+        }
+    }
+    return NULL;
+}
+
+static bool cld_import_cache_upsert(CldImportCache *cache,
+                                    const char *symbol,
+                                    const char *dylib,
+                                    CldError *error) {
+    size_t new_capacity;
+    CldImportCacheEntry *grown;
+
+    if (cache == NULL || symbol == NULL || dylib == NULL ||
+        symbol[0] == '\0' || dylib[0] == '\0') {
+        return true;
     }
 
-    if (fgets(sdk_path, sizeof(sdk_path), pipe_handle) == NULL) {
-        (void) pclose(pipe_handle);
-        cld_set_error(error,
-                      "xcrun --show-sdk-path did not return an SDK path; install Xcode or the Command Line Tools");
-        return false;
+    for (size_t i = 0; i < cache->count; ++i) {
+        if (cache->entries[i].symbol != NULL && strcmp(cache->entries[i].symbol, symbol) == 0) {
+            if (cache->entries[i].dylib != NULL && strcmp(cache->entries[i].dylib, dylib) == 0) {
+                return true;
+            }
+            free(cache->entries[i].dylib);
+            cache->entries[i].dylib = strdup(dylib);
+            if (cache->entries[i].dylib == NULL) {
+                cld_set_error(error, "out of memory updating cache for %s", symbol);
+                return false;
+            }
+            return true;
+        }
     }
 
-    close_status = pclose(pipe_handle);
-    if (close_status != 0) {
-        cld_set_error(error,
-                      "xcrun --show-sdk-path failed; install Xcode or the Command Line Tools");
-        return false;
+    if (cache->count == cache->capacity) {
+        new_capacity = cache->capacity == 0 ? 128 : cache->capacity * 2;
+        grown = (CldImportCacheEntry *)realloc(cache->entries,
+                                               new_capacity * sizeof(CldImportCacheEntry));
+        if (grown == NULL) {
+            cld_set_error(error, "out of memory growing import cache");
+            return false;
+        }
+        cache->entries = grown;
+        cache->capacity = new_capacity;
     }
 
-    sdk_path[strcspn(sdk_path, "\r\n")] = '\0';
-    sdk_path_length = strlen(sdk_path);
-    if (sdk_path_length == 0) {
-        cld_set_error(error,
-                      "xcrun --show-sdk-path returned an empty SDK path; install Xcode or the Command Line Tools");
+    cache->entries[cache->count].symbol = strdup(symbol);
+    cache->entries[cache->count].dylib = strdup(dylib);
+    if (cache->entries[cache->count].symbol == NULL ||
+        cache->entries[cache->count].dylib == NULL) {
+        free(cache->entries[cache->count].symbol);
+        free(cache->entries[cache->count].dylib);
+        cache->entries[cache->count].symbol = NULL;
+        cache->entries[cache->count].dylib = NULL;
+        cld_set_error(error, "out of memory appending import cache entry");
         return false;
     }
-
-    result_length = sdk_path_length + strlen(suffix);
-    resolved_path = malloc(result_length + 1);
-    if (resolved_path == NULL) {
-        cld_set_error(error, "out of memory allocating macOS system library path");
-        return false;
-    }
-
-    memcpy(resolved_path, sdk_path, sdk_path_length);
-    memcpy(resolved_path + sdk_path_length, suffix, sizeof(suffix));
-    if (access(resolved_path, R_OK) != 0) {
-        free(resolved_path);
-        cld_set_error(error,
-                      "macOS system library stub was not found at the SDK path; install Xcode or the Command Line Tools");
-        return false;
-    }
-
-    *libsystem_path = resolved_path;
+    cache->count++;
     return true;
 }
 
-static void cld_format_macho_version(uint32_t packed_version, char buffer[32]) {
-    uint32_t major_version;
-    uint32_t minor_version;
-    uint32_t patch_version;
+static bool cld_symbol_name_set_contains(const CldSymbolNameSet *set, const char *name) {
+    size_t name_length;
 
-    major_version = (packed_version >> 16) & 0xffffu;
-    minor_version = (packed_version >> 8) & 0xffu;
-    patch_version = packed_version & 0xffu;
-    if (patch_version != 0) {
-        snprintf(buffer, 32, "%u.%u.%u", major_version, minor_version, patch_version);
+    if (set == NULL || name == NULL) {
+        return false;
+    }
+    name_length = strlen(name);
+    for (size_t i = 0; i < set->count; ++i) {
+        const char *candidate;
+
+        candidate = set->names[i];
+        if (candidate == NULL) {
+            continue;
+        }
+        if (strcmp(candidate, name) == 0) {
+            return true;
+        }
+        if (strncmp(candidate, name, name_length) == 0 && candidate[name_length] == '$') {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool cld_symbol_name_set_add(CldSymbolNameSet *set, const char *name, CldError *error) {
+    char *copy;
+    size_t new_capacity;
+    char **grown;
+
+    if (set == NULL || name == NULL || name[0] == '\0') {
+        return true;
+    }
+    if (cld_symbol_name_set_contains(set, name)) {
+        return true;
+    }
+    if (set->count == set->capacity) {
+        new_capacity = set->capacity == 0 ? 256 : set->capacity * 2;
+        grown = (char **) realloc(set->names, new_capacity * sizeof(char *));
+        if (grown == NULL) {
+            cld_set_error(error, "out of memory growing symbol name set");
+            return false;
+        }
+        set->names = grown;
+        set->capacity = new_capacity;
+    }
+    copy = strdup(name);
+    if (copy == NULL) {
+        cld_set_error(error, "out of memory duplicating symbol name %s", name);
+        return false;
+    }
+    set->names[set->count++] = copy;
+    return true;
+}
+
+
+static bool cld_extract_tbd_install_name(const char *line, char *output, size_t output_size) {
+    const char *install;
+    const char *quote_start;
+    const char *quote_end;
+    size_t length;
+
+    install = strstr(line, "install-name:");
+    if (install == NULL) {
+        return false;
+    }
+    quote_start = strchr(install, '\'');
+    if (quote_start == NULL) {
+        quote_start = strchr(install, '"');
+        if (quote_start == NULL) {
+            return false;
+        }
+    }
+    ++quote_start;
+    quote_end = strchr(quote_start, quote_start[-1]);
+    if (quote_end == NULL) {
+        return false;
+    }
+    length = (size_t) (quote_end - quote_start);
+    if (length == 0 || length >= output_size) {
+        return false;
+    }
+    memcpy(output, quote_start, length);
+    output[length] = '\0';
+    return true;
+}
+
+static void cld_normalize_tbd_symbol(const char *raw,
+                                     char *normalized,
+                                     size_t normalized_size) {
+    const char *chosen;
+    const char *last_dollar;
+
+    if (normalized_size == 0) {
+        return;
+    }
+    normalized[0] = '\0';
+    if (raw == NULL || raw[0] == '\0') {
         return;
     }
 
-    snprintf(buffer, 32, "%u.%u", major_version, minor_version);
-}
-
-static bool cld_link_macho_arm64_with_system_ld(const CldMachOObject *object_files,
-                                                size_t object_count,
-                                                const CldLinkOptions *options,
-                                                const struct build_version_command *build_version,
-                                                const char *libsystem_tbd_path,
-                                                CldError *error) {
-    size_t argument_count;
-    char **arguments;
-    size_t argument_index;
-    char minos_version[32];
-    char sdk_version[32];
-    pid_t process_id;
-    int spawn_status;
-    int wait_status;
-
-    cld_format_macho_version(build_version->minos, minos_version);
-    cld_format_macho_version(build_version->sdk != 0 ? build_version->sdk : build_version->minos, sdk_version);
-
-    argument_count = 11 + object_count;
-    arguments = calloc(argument_count + 1, sizeof(*arguments));
-    if (arguments == NULL) {
-        cld_set_error(error, "out of memory allocating system linker arguments");
-        return false;
-    }
-
-    argument_index = 0;
-    arguments[argument_index++] = "/usr/bin/ld";
-    arguments[argument_index++] = "-arch";
-    arguments[argument_index++] = "arm64";
-    arguments[argument_index++] = "-platform_version";
-    arguments[argument_index++] = "macos";
-    arguments[argument_index++] = minos_version;
-    arguments[argument_index++] = sdk_version;
-    arguments[argument_index++] = "-e";
-    arguments[argument_index++] = (char *) (options->entry_symbol != NULL ? options->entry_symbol : "_main");
-    arguments[argument_index++] = "-o";
-    arguments[argument_index++] = (char *) options->output_path;
-    for (size_t object_index = 0; object_index < object_count; ++object_index) {
-        arguments[argument_index++] = object_files[object_index].path;
-    }
-    arguments[argument_index++] = (char *) libsystem_tbd_path;
-
-    spawn_status = posix_spawn(&process_id, arguments[0], NULL, NULL, arguments, environ);
-    free(arguments);
-    if (spawn_status != 0) {
-        cld_set_error(error, "failed to launch the macOS system linker");
-        return false;
-    }
-
-    if (waitpid(process_id, &wait_status, 0) < 0) {
-        cld_set_error(error, "failed to wait for the macOS system linker");
-        return false;
-    }
-
-    if (!WIFEXITED(wait_status) || WEXITSTATUS(wait_status) != 0) {
-        cld_set_error(error, "the macOS system linker failed while resolving external symbols");
-        return false;
-    }
-
-    return true;
-}
-
-static bool cld_spawn_and_wait(char *const arguments[], const char *tool_name, CldError *error) {
-    pid_t process_id;
-    int spawn_status;
-    int wait_status;
-
-    spawn_status = posix_spawnp(&process_id, arguments[0], NULL, NULL, arguments, environ);
-    if (spawn_status != 0) {
-        cld_set_error(error, "failed to launch %s; ensure the tool is installed and on PATH", tool_name);
-        return false;
-    }
-
-    if (waitpid(process_id, &wait_status, 0) < 0) {
-        cld_set_error(error, "failed to wait for %s", tool_name);
-        return false;
-    }
-
-    if (!WIFEXITED(wait_status) || WEXITSTATUS(wait_status) != 0) {
-        cld_set_error(error, "%s failed", tool_name);
-        return false;
-    }
-
-    return true;
-}
-
-static bool cld_link_x86_64_elf(const CldMachOObject *object_files,
-                                size_t object_count,
-                                const CldLinkOptions *options,
-                                CldError *error) {
-    size_t argument_count;
-    char **arguments;
-    size_t argument_index;
-    char entry_option[512];
-    bool success;
-
-    argument_count = 5 + object_count + (options->output_kind == CLD_OUTPUT_KIND_EXECUTABLE ? 1 : 0);
-    arguments = calloc(argument_count + 1, sizeof(*arguments));
-    if (arguments == NULL) {
-        cld_set_error(error, "out of memory allocating x86_64-elf-gcc arguments");
-        return false;
-    }
-
-    argument_index = 0;
-    arguments[argument_index++] = "x86_64-elf-gcc";
-    arguments[argument_index++] = "-nostdlib";
-    if (options->output_kind == CLD_OUTPUT_KIND_RELOCATABLE) {
-        arguments[argument_index++] = "-r";
+    chosen = raw;
+    last_dollar = strrchr(raw, '$');
+    if (last_dollar != NULL && last_dollar[1] == '_') {
+        chosen = last_dollar + 1;
     } else {
-        snprintf(entry_option,
-                 sizeof(entry_option),
-                 "-Wl,-e,%s",
-                 options->entry_symbol != NULL ? options->entry_symbol : "main");
-        arguments[argument_index++] = entry_option;
-    }
-    arguments[argument_index++] = "-o";
-    arguments[argument_index++] = (char *) options->output_path;
-    for (size_t object_index = 0; object_index < object_count; ++object_index) {
-        arguments[argument_index++] = object_files[object_index].path;
+        const char *decorated = strstr(raw, "$_");
+        if (decorated != NULL && decorated[1] == '_') {
+            chosen = decorated + 1;
+        }
     }
 
-    success = cld_spawn_and_wait(arguments, "x86_64-elf-gcc", error);
-    free(arguments);
-    if (!success) {
+    snprintf(normalized, normalized_size, "%s", chosen);
+}
+
+static bool cld_tbd_symbol_matches(const char *requested,
+                                   const char *normalized_candidate) {
+    size_t requested_length;
+
+    if (requested == NULL || normalized_candidate == NULL) {
+        return false;
+    }
+    if (strcmp(requested, normalized_candidate) == 0) {
+        return true;
+    }
+    requested_length = strlen(requested);
+    return strncmp(normalized_candidate, requested, requested_length) == 0 &&
+           normalized_candidate[requested_length] == '$';
+}
+
+static bool cld_find_symbol_dylib_in_sdk_tbd_dir(const char *sdk_lib_dir,
+                                                 const char *requested_symbol,
+                                                 char *out_dylib,
+                                                 size_t out_dylib_size,
+                                                 CldError *error) {
+    DIR *directory;
+    struct dirent *entry;
+
+    directory = opendir(sdk_lib_dir);
+    if (directory == NULL) {
+        cld_set_error(error, "failed to open SDK lib dir %s", sdk_lib_dir);
         return false;
     }
 
-    if (chmod(options->output_path,
-              options->output_kind == CLD_OUTPUT_KIND_EXECUTABLE ? 0755 : 0644) != 0) {
-        cld_set_error(error, "linked output was written but chmod failed for %s", options->output_path);
+    while ((entry = readdir(directory)) != NULL) {
+        const char *name;
+        size_t name_length;
+        FILE *file;
+        char path[4096];
+        char line[32768];
+        char current_install_name[1024];
+
+        name = entry->d_name;
+        if (name == NULL || strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+            continue;
+        }
+        name_length = strlen(name);
+        if (name_length < 5 || strcmp(name + (name_length - 4), ".tbd") != 0) {
+            continue;
+        }
+
+        snprintf(path, sizeof(path), "%s/%s", sdk_lib_dir, name);
+        file = fopen(path, "rb");
+        if (file == NULL) {
+            continue;
+        }
+
+        current_install_name[0] = '\0';
+        while (fgets(line, sizeof(line), file) != NULL) {
+            char parsed_install_name[1024];
+            char *cursor;
+
+            if (cld_extract_tbd_install_name(line, parsed_install_name, sizeof(parsed_install_name))) {
+                snprintf(current_install_name, sizeof(current_install_name), "%s", parsed_install_name);
+            }
+
+            cursor = line;
+            while (*cursor != '\0') {
+                char quote = *cursor;
+                char *end;
+                size_t length;
+                char symbol[512];
+                char normalized_symbol[512];
+
+                if (quote != '\'' && quote != '"') {
+                    ++cursor;
+                    continue;
+                }
+
+                ++cursor;
+                end = strchr(cursor, quote);
+                if (end == NULL) {
+                    break;
+                }
+                length = (size_t) (end - cursor);
+                if (length > 0 && length < sizeof(symbol)) {
+                    memcpy(symbol, cursor, length);
+                    symbol[length] = '\0';
+                    cld_normalize_tbd_symbol(symbol,
+                                             normalized_symbol,
+                                             sizeof(normalized_symbol));
+                    if (normalized_symbol[0] == '_' &&
+                        cld_tbd_symbol_matches(requested_symbol, normalized_symbol) &&
+                        current_install_name[0] != '\0') {
+                        snprintf(out_dylib, out_dylib_size, "%s", current_install_name);
+                        fclose(file);
+                        closedir(directory);
+                        return true;
+                    }
+                }
+                cursor = end + 1;
+            }
+
+            cursor = line;
+            while (*cursor != '\0') {
+                const char *start;
+                size_t length;
+                char symbol[512];
+                char normalized_symbol[512];
+
+                if (*cursor != '_') {
+                    ++cursor;
+                    continue;
+                }
+
+                start = cursor;
+                ++cursor;
+                while (*cursor != '\0' &&
+                       (isalnum((unsigned char) *cursor) || *cursor == '_' || *cursor == '$' || *cursor == '.')) {
+                    ++cursor;
+                }
+
+                length = (size_t) (cursor - start);
+                if (length == 0 || length >= sizeof(symbol)) {
+                    continue;
+                }
+
+                memcpy(symbol, start, length);
+                symbol[length] = '\0';
+                cld_normalize_tbd_symbol(symbol,
+                                         normalized_symbol,
+                                         sizeof(normalized_symbol));
+                if (normalized_symbol[0] == '_' &&
+                    cld_tbd_symbol_matches(requested_symbol, normalized_symbol) &&
+                    current_install_name[0] != '\0') {
+                    snprintf(out_dylib, out_dylib_size, "%s", current_install_name);
+                    fclose(file);
+                    closedir(directory);
+                    return true;
+                }
+            }
+        }
+
+        fclose(file);
+    }
+
+    closedir(directory);
+    return false;
+}
+
+static bool cld_load_sdk_tbd_exports_and_dylibs(const char *sdk_lib_dir,
+                                                CldSymbolNameSet *exports,
+                                                CldSymbolNameSet *dylibs,
+                                                CldError *error) {
+    DIR *directory;
+    struct dirent *entry;
+
+    directory = opendir(sdk_lib_dir);
+    if (directory == NULL) {
+        cld_set_error(error, "failed to open SDK lib dir %s", sdk_lib_dir);
+        return false;
+    }
+
+    while ((entry = readdir(directory)) != NULL) {
+        const char *name;
+        size_t name_length;
+        FILE *file;
+        char path[4096];
+        char line[32768];
+        char current_install_name[1024];
+
+        name = entry->d_name;
+        if (name == NULL) {
+            continue;
+        }
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+            continue;
+        }
+        name_length = strlen(name);
+        if (name_length < 5 || strcmp(name + (name_length - 4), ".tbd") != 0) {
+            continue;
+        }
+
+        snprintf(path, sizeof(path), "%s/%s", sdk_lib_dir, name);
+        file = fopen(path, "rb");
+        if (file == NULL) {
+            continue;
+        }
+
+        current_install_name[0] = '\0';
+        while (fgets(line, sizeof(line), file) != NULL) {
+            char parsed_install_name[1024];
+            char *cursor;
+
+            if (cld_extract_tbd_install_name(line, parsed_install_name, sizeof(parsed_install_name))) {
+                snprintf(current_install_name, sizeof(current_install_name), "%s", parsed_install_name);
+                if (!cld_symbol_name_set_add(dylibs, current_install_name, error)) {
+                    fclose(file);
+                    closedir(directory);
+                    return false;
+                }
+            }
+
+            cursor = line;
+            while (*cursor != '\0') {
+                char quote = *cursor;
+                char *end;
+                size_t length;
+                char symbol[512];
+                const char *normalized;
+                const char *last_dollar;
+
+                if (quote != '\'' && quote != '"') {
+                    ++cursor;
+                    continue;
+                }
+
+                ++cursor;
+                end = strchr(cursor, quote);
+                if (end == NULL) {
+                    break;
+                }
+                length = (size_t) (end - cursor);
+                if (length > 0 && length < sizeof(symbol)) {
+                    memcpy(symbol, cursor, length);
+                    symbol[length] = '\0';
+                    normalized = symbol;
+                    last_dollar = strrchr(symbol, '$');
+                    if (last_dollar != NULL && last_dollar[1] == '_') {
+                        normalized = last_dollar + 1;
+                    } else {
+                        const char *decorated = strstr(symbol, "$_");
+                        if (decorated != NULL && decorated[1] == '_') {
+                            normalized = decorated + 1;
+                        }
+                    }
+                    if (normalized[0] == '_') {
+                        if (!cld_symbol_name_set_add(exports, normalized, error)) {
+                            fclose(file);
+                            closedir(directory);
+                            return false;
+                        }
+                    }
+                }
+                cursor = end + 1;
+            }
+
+            cursor = line;
+            while (*cursor != '\0') {
+                const char *start;
+                size_t length;
+                char symbol[512];
+                const char *normalized;
+                const char *last_dollar;
+
+                if (*cursor != '_') {
+                    ++cursor;
+                    continue;
+                }
+
+                start = cursor;
+                ++cursor;
+                while (*cursor != '\0' &&
+                       (isalnum((unsigned char) *cursor) || *cursor == '_' || *cursor == '$' || *cursor == '.')) {
+                    ++cursor;
+                }
+
+                length = (size_t) (cursor - start);
+                if (length == 0 || length >= sizeof(symbol)) {
+                    continue;
+                }
+
+                memcpy(symbol, start, length);
+                symbol[length] = '\0';
+                normalized = symbol;
+                last_dollar = strrchr(symbol, '$');
+                if (last_dollar != NULL && last_dollar[1] == '_') {
+                    normalized = last_dollar + 1;
+                } else {
+                    const char *decorated = strstr(symbol, "$_");
+                    if (decorated != NULL && decorated[1] == '_') {
+                        normalized = decorated + 1;
+                    }
+                }
+
+                if (normalized[0] == '_') {
+                    if (!cld_symbol_name_set_add(exports, normalized, error)) {
+                        fclose(file);
+                        closedir(directory);
+                        return false;
+                    }
+                }
+            }
+        }
+
+        fclose(file);
+    }
+
+    closedir(directory);
+    return true;
+}
+
+static bool cld_load_sdk_tbd_cache(const char *cache_path,
+                                   CldImportCache *cache,
+                                   bool *cache_hit,
+                                   CldError *error) {
+    FILE *file;
+    char line[32768];
+
+    if (cache_hit != NULL)
+        *cache_hit = false;
+
+    file = fopen(cache_path, "rb");
+    if (file == NULL) {
+        if (errno == ENOENT) {
+            return true;
+        }
+        cld_set_error(error, "failed to open tbd cache %s", cache_path);
+        return false;
+    }
+
+    if (fgets(line, sizeof(line), file) == NULL) {
+        fclose(file);
+        return true;
+    }
+    line[strcspn(line, "\r\n")] = '\0';
+    if (strcmp(line, CLD_MACOS_SDK_TBD_CACHE_HEADER) != 0) {
+        fclose(file);
+        return true;
+    }
+
+    while (fgets(line, sizeof(line), file) != NULL) {
+        char kind;
+        char *payload;
+
+        line[strcspn(line, "\r\n")] = '\0';
+        if (line[0] == '\0') {
+            continue;
+        }
+        kind = line[0];
+        payload = line + 1;
+        if (payload[0] == '\0') {
+            continue;
+        }
+        if (kind == 'M') {
+            char *separator = strchr(payload, '\t');
+            if (separator == NULL) {
+                continue;
+            }
+            *separator = '\0';
+            ++separator;
+            if (!cld_import_cache_upsert(cache, payload, separator, error)) {
+                fclose(file);
+                return false;
+            }
+        }
+    }
+
+    fclose(file);
+    if (cache_hit != NULL) {
+        *cache_hit = (cache->count != 0);
+    }
+    return true;
+}
+
+static bool cld_write_sdk_tbd_cache(const char *cache_path,
+                                    const CldImportCache *cache,
+                                    CldError *error) {
+    FILE *file;
+
+    file = fopen(cache_path, "wb");
+    if (file == NULL) {
+        cld_set_error(error, "failed to create tbd cache %s", cache_path);
+        return false;
+    }
+
+    fprintf(file, "%s\n", CLD_MACOS_SDK_TBD_CACHE_HEADER);
+    if (cache != NULL) {
+        for (size_t i = 0; i < cache->count; ++i) {
+            const CldImportCacheEntry *entry = &cache->entries[i];
+            if (entry->symbol != NULL && entry->dylib != NULL &&
+                entry->symbol[0] != '\0' && entry->dylib[0] != '\0') {
+                fprintf(file, "M%s\t%s\n", entry->symbol, entry->dylib);
+            }
+        }
+    }
+
+    if (fclose(file) != 0) {
+        cld_set_error(error, "failed to finalize tbd cache %s", cache_path);
         return false;
     }
 
     return true;
 }
+
+bool cld_flush_sdk_cache(CldError *error) {
+    if (unlink(CLD_MACOS_SDK_TBD_CACHE_PATH) == 0) {
+        return true;
+    }
+    if (errno == ENOENT) {
+        return true;
+    }
+    cld_set_error(error, "failed to remove cache %s", CLD_MACOS_SDK_TBD_CACHE_PATH);
+    return false;
+}
+
+
 
 static bool cld_run_codesign(const char *output_path, CldError *error) {
     pid_t process_id;
@@ -558,6 +996,39 @@ static void cld_write_u64(uint8_t *data, uint32_t width, uint64_t value) {
     }
 }
 
+static bool cld_symbol_names_match(const char *left, const char *right) {
+    const char *left_normalized;
+    const char *right_normalized;
+    size_t left_length;
+    size_t right_length;
+
+    if (left == NULL || right == NULL) {
+        return false;
+    }
+
+    left_normalized = (left[0] == '_') ? (left + 1) : left;
+    right_normalized = (right[0] == '_') ? (right + 1) : right;
+
+    if (strcmp(left_normalized, right_normalized) == 0) {
+        return true;
+    }
+
+    left_length = strlen(left_normalized);
+    right_length = strlen(right_normalized);
+    if (left_length > right_length &&
+        strncmp(left_normalized, right_normalized, right_length) == 0 &&
+        (left_normalized[right_length] == '$' || left_normalized[right_length] == '.')) {
+        return true;
+    }
+    if (right_length > left_length &&
+        strncmp(right_normalized, left_normalized, left_length) == 0 &&
+        (right_normalized[left_length] == '$' || right_normalized[left_length] == '.')) {
+        return true;
+    }
+
+    return false;
+}
+
 static bool cld_lookup_defined_symbol_by_name(const CldResolvedSymbol *symbols,
                                               size_t symbol_count,
                                               const char *name,
@@ -566,10 +1037,8 @@ static bool cld_lookup_defined_symbol_by_name(const CldResolvedSymbol *symbols,
                                               CldError *error) {
     size_t symbol_index;
     bool found;
-    const CldResolvedSymbol *first_symbol;
-
+    (void) error;
     found = false;
-    first_symbol = NULL;
     for (symbol_index = 0; symbol_index < symbol_count; ++symbol_index) {
         if (!symbols[symbol_index].is_defined) {
             continue;
@@ -577,20 +1046,17 @@ static bool cld_lookup_defined_symbol_by_name(const CldResolvedSymbol *symbols,
         if (external_only && (symbols[symbol_index].type & N_EXT) == 0) {
             continue;
         }
-        if (strcmp(symbols[symbol_index].name, name) != 0) {
+        if (!cld_symbol_names_match(symbols[symbol_index].name, name)) {
             continue;
         }
         if (found) {
-            cld_set_error(error,
-                          "multiple definitions of symbol %s in %s and %s",
-                          name,
-                          first_symbol->source_path,
-                          symbols[symbol_index].source_path);
-            return false;
+            /* Keep the first matching definition. Some generated object sets
+               can contain duplicate non-external entries for the same name. */
+            continue;
         }
+
         *value = symbols[symbol_index].value;
         found = true;
-        first_symbol = &symbols[symbol_index];
     }
 
     return found;
@@ -609,7 +1075,7 @@ static size_t cld_find_defined_symbol_index_by_name(const CldResolvedSymbol *sym
         if (external_only && (symbols[symbol_index].type & N_EXT) == 0) {
             continue;
         }
-        if (strcmp(symbols[symbol_index].name, name) == 0) {
+        if (cld_symbol_names_match(symbols[symbol_index].name, name)) {
             return symbol_index;
         }
     }
@@ -632,7 +1098,7 @@ static bool cld_validate_unique_external_definitions(const CldResolvedSymbol *sy
             if (!symbols[right_index].is_defined || (symbols[right_index].type & N_EXT) == 0) {
                 continue;
             }
-            if (strcmp(symbols[left_index].name, symbols[right_index].name) != 0) {
+            if (!cld_symbol_names_match(symbols[left_index].name, symbols[right_index].name)) {
                 continue;
             }
 
@@ -646,6 +1112,49 @@ static bool cld_validate_unique_external_definitions(const CldResolvedSymbol *sy
     }
 
     return true;
+}
+
+static void cld_log_nearby_defined_symbols(const CldResolvedSymbol *symbols,
+                                           size_t symbol_count,
+                                           const char *requested_name) {
+    const char *requested_normalized;
+    size_t requested_length;
+    size_t shown;
+
+    if (symbols == NULL || requested_name == NULL) {
+        return;
+    }
+
+    requested_normalized = requested_name[0] == '_' ? (requested_name + 1) : requested_name;
+    requested_length = strlen(requested_normalized);
+    if (requested_length == 0) {
+        return;
+    }
+
+    shown = 0;
+    for (size_t i = 0; i < symbol_count; ++i) {
+        const char *candidate;
+        const char *candidate_normalized;
+
+        if (!symbols[i].is_defined || symbols[i].name == NULL) {
+            continue;
+        }
+        candidate = symbols[i].name;
+        candidate_normalized = candidate[0] == '_' ? (candidate + 1) : candidate;
+
+        if (strncmp(candidate_normalized, requested_normalized, requested_length) != 0) {
+            continue;
+        }
+
+        if (shown == 0) {
+            fprintf(stderr, "cld: note: nearby defined symbols for %s:\n", requested_name);
+        }
+        fprintf(stderr, "cld: note:   %s\n", candidate);
+        ++shown;
+        if (shown >= 16) {
+            break;
+        }
+    }
 }
 
 static bool cld_resolve_relocation_target(const CldInputObjectState *object_state,
@@ -762,7 +1271,12 @@ static bool cld_patch_pageoff12(uint8_t *contents, uint64_t target, uint32_t len
 
     instruction = (uint32_t) cld_read_u64(contents, 4);
     offset_in_page = target & (page_size - 1u);
-    scale = 1ull << length;
+    if ((instruction & 0x1f000000u) == 0x11000000u) {
+        /* add/sub (immediate): imm12 is unscaled */
+        scale = 1ull;
+    } else {
+        scale = 1ull << length;
+    }
     if ((offset_in_page % scale) != 0) {
         cld_set_error(error, "pageoff12 relocation target is not aligned for the instruction scale");
         return false;
@@ -809,6 +1323,10 @@ static bool cld_apply_relocations(const CldTarget *target,
                                   size_t section_count,
                                   const CldInputObjectState *object_states,
                                   const CldResolvedSymbol *symbols,
+                                  CldOutputSection *startup_section,
+                                  uint32_t *import_stub_slots,
+                                  size_t import_stub_slot_count,
+                                  uint32_t *next_import_stub_slot,
                                   CldError *error) {
     size_t section_index;
 
@@ -854,6 +1372,124 @@ static bool cld_apply_relocations(const CldTarget *target,
 
             fixup = section->contents + relocation->r_address;
             place = section->address + (uint64_t) relocation->r_address;
+
+            if (relocation->r_extern) {
+                size_t input_symbol_index;
+                size_t resolved_symbol_index;
+
+                input_symbol_index = relocation->r_symbolnum;
+                if (input_symbol_index >= object_state->input->symbol_count) {
+                    cld_set_error(error, "relocation references symbol index %u outside the symbol table", relocation->r_symbolnum);
+                    return false;
+                }
+                resolved_symbol_index = object_state->symbol_start + input_symbol_index;
+                if (!symbols[resolved_symbol_index].is_defined && symbols[resolved_symbol_index].is_dynamic_import) {
+                    uint32_t stub_slot;
+                    uint64_t stub_address;
+                    uint64_t host_symbol_address;
+                    const char *host_symbol_name;
+                    void *host_symbol_ptr;
+
+                    if (relocation->r_type != ARM64_RELOC_BRANCH26) {
+                        cld_set_error(error,
+                                      "dynamic import relocation type %u for %s is not supported yet",
+                                      relocation->r_type,
+                                      symbols[resolved_symbol_index].name);
+                        return false;
+                    }
+
+                    if (resolved_symbol_index >= import_stub_slot_count) {
+                        cld_set_error(error, "internal error: dynamic import slot index is out of range");
+                        return false;
+                    }
+
+                    stub_slot = import_stub_slots[resolved_symbol_index];
+                    if (stub_slot == UINT32_MAX) {
+                        if (*next_import_stub_slot >= CLD_IMPORT_STUB_CAPACITY) {
+                            cld_set_error(error,
+                                          "dynamic import count exceeded reserved capacity (%u)",
+                                          (unsigned int) CLD_IMPORT_STUB_CAPACITY);
+                            return false;
+                        }
+
+                        host_symbol_name = symbols[resolved_symbol_index].name;
+                        if (host_symbol_name != NULL && host_symbol_name[0] == '_') {
+                            host_symbol_name += 1;
+                        }
+
+                        host_symbol_ptr = NULL;
+                        if (symbols[resolved_symbol_index].dynamic_import_dylib != NULL &&
+                            symbols[resolved_symbol_index].dynamic_import_dylib[0] != '\0') {
+                            void *import_handle;
+                            import_handle = dlopen(symbols[resolved_symbol_index].dynamic_import_dylib,
+                                                   RTLD_LAZY);
+                            if (import_handle == NULL) {
+                                cld_set_error(error,
+                                              "unable to open import dylib %s for symbol %s",
+                                              symbols[resolved_symbol_index].dynamic_import_dylib,
+                                              symbols[resolved_symbol_index].name);
+                                return false;
+                            }
+                            host_symbol_ptr = dlsym(import_handle, host_symbol_name);
+                            if (host_symbol_ptr == NULL) {
+                                host_symbol_ptr = dlsym(import_handle, symbols[resolved_symbol_index].name);
+                            }
+                        }
+                        if (host_symbol_ptr == NULL) {
+                            host_symbol_ptr = dlsym(RTLD_DEFAULT, host_symbol_name);
+                        }
+                        if (host_symbol_ptr == NULL) {
+                            host_symbol_ptr = dlsym(RTLD_DEFAULT, symbols[resolved_symbol_index].name);
+                        }
+                        if (host_symbol_ptr == NULL) {
+                            cld_set_error(error,
+                                          "unable to resolve host symbol for dynamic import %s",
+                                          symbols[resolved_symbol_index].name);
+                            return false;
+                        }
+
+                        host_symbol_address = (uint64_t) (uintptr_t) host_symbol_ptr;
+                        stub_slot = *next_import_stub_slot;
+                        *next_import_stub_slot += 1;
+                        import_stub_slots[resolved_symbol_index] = stub_slot;
+
+                        if ((uint64_t) CLD_STARTUP_PROLOGUE_SIZE
+                            + ((uint64_t) stub_slot + 1u) * CLD_IMPORT_STUB_SIZE
+                            > startup_section->size) {
+                            cld_set_error(error, "startup section import-stub area is too small");
+                            return false;
+                        }
+
+                        cld_write_u64(startup_section->contents
+                                      + CLD_STARTUP_PROLOGUE_SIZE
+                                      + (size_t) stub_slot * CLD_IMPORT_STUB_SIZE,
+                                      4,
+                                      CLD_ARM64_LDR_LITERAL_X16_PLUS8);
+                        cld_write_u64(startup_section->contents
+                                      + CLD_STARTUP_PROLOGUE_SIZE
+                                      + (size_t) stub_slot * CLD_IMPORT_STUB_SIZE
+                                      + 4,
+                                      4,
+                                      CLD_ARM64_BR_X16);
+                        cld_write_u64(startup_section->contents
+                                      + CLD_STARTUP_PROLOGUE_SIZE
+                                      + (size_t) stub_slot * CLD_IMPORT_STUB_SIZE
+                                      + 8,
+                                      8,
+                                      host_symbol_address);
+                    }
+
+                    stub_address = startup_section->address
+                                 + CLD_STARTUP_PROLOGUE_SIZE
+                                 + (uint64_t) stub_slot * CLD_IMPORT_STUB_SIZE;
+
+                    if (!cld_patch_branch26(fixup, place, stub_address, error)) {
+                        return false;
+                    }
+                    pending_addend = 0;
+                    continue;
+                }
+            }
 
             if (relocation->r_type == ARM64_RELOC_SUBTRACTOR) {
                 const struct relocation_info *next_relocation;
@@ -1587,15 +2223,19 @@ static bool cld_link_macho_arm64_executable(const CldMachOObject *object_files,
     uint8_t *command_cursor;
     size_t command_count;
     size_t dylinker_command_size;
-    size_t dylib_command_size;
-    char *libsystem_tbd_path;
+    size_t dylib_commands_size;
     uint64_t entry_value;
     size_t startup_section_index;
     uint32_t local_symbol_count;
     uint32_t external_symbol_count;
+    uint32_t *import_stub_slots;
+    uint32_t next_import_stub_slot;
     bool has_build_version;
     struct build_version_command build_version;
-    bool needs_system_linker;
+    CldImportCache import_cache;
+    CldSymbolNameSet needed_dylibs;
+    bool tbd_cache_hit;
+    bool tbd_cache_dirty;
     bool success;
 
     target = options->target != NULL ? options->target : &cld_target_macos_arm64;
@@ -1609,8 +2249,13 @@ static bool cld_link_macho_arm64_executable(const CldMachOObject *object_files,
     symtab_bytes = NULL;
     string_bytes = NULL;
     output_bytes = NULL;
-    libsystem_tbd_path = NULL;
-    needs_system_linker = false;
+    import_stub_slots = NULL;
+    next_import_stub_slot = 0;
+    dylib_commands_size = 0;
+    memset(&import_cache, 0, sizeof(import_cache));
+    memset(&needed_dylibs, 0, sizeof(needed_dylibs));
+    tbd_cache_hit = false;
+    tbd_cache_dirty = false;
     success = false;
     total_symbol_count = 0;
     output_section_count = 1;
@@ -1622,6 +2267,15 @@ static bool cld_link_macho_arm64_executable(const CldMachOObject *object_files,
 
     if (!cld_validate_build_versions(object_files, object_count, &has_build_version, &build_version, error)) {
         goto cleanup;
+    }
+
+    if (!options->no_stdlib) {
+        if (!cld_load_sdk_tbd_cache(CLD_MACOS_SDK_TBD_CACHE_PATH,
+                                    &import_cache,
+                                    &tbd_cache_hit,
+                                    error)) {
+            goto cleanup;
+        }
     }
 
     for (object_index = 0; object_index < object_count; ++object_index) {
@@ -1650,6 +2304,14 @@ static bool cld_link_macho_arm64_executable(const CldMachOObject *object_files,
         cld_set_error(error, "out of memory allocating linker state");
         goto cleanup;
     }
+    import_stub_slots = malloc(total_symbol_count * sizeof(*import_stub_slots));
+    if (import_stub_slots == NULL) {
+        cld_set_error(error, "out of memory allocating dynamic import stub map");
+        goto cleanup;
+    }
+    for (symbol_index = 0; symbol_index < total_symbol_count; ++symbol_index) {
+        import_stub_slots[symbol_index] = UINT32_MAX;
+    }
 
     startup_section_index = 0;
     memset(&sections[startup_section_index], 0, sizeof(sections[startup_section_index]));
@@ -1660,7 +2322,7 @@ static bool cld_link_macho_arm64_executable(const CldMachOObject *object_files,
     sections[startup_section_index].input_object_index = SIZE_MAX;
     sections[startup_section_index].flags = S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS;
     sections[startup_section_index].align = 2;
-    sections[startup_section_index].size = 12;
+    sections[startup_section_index].size = CLD_STARTUP_PROLOGUE_SIZE + ((uint64_t) CLD_IMPORT_STUB_CAPACITY * CLD_IMPORT_STUB_SIZE);
     sections[startup_section_index].contents = calloc(1, (size_t) sections[startup_section_index].size);
     if (sections[startup_section_index].contents == NULL) {
         cld_set_error(error, "out of memory allocating startup section");
@@ -1668,7 +2330,9 @@ static bool cld_link_macho_arm64_executable(const CldMachOObject *object_files,
     }
     cld_write_u64(sections[startup_section_index].contents + 0, 4, 0x94000000u);
     cld_write_u64(sections[startup_section_index].contents + 4, 4, 0xd2800030u);
-    cld_write_u64(sections[startup_section_index].contents + 8, 4, 0xd4001001u);
+    cld_write_u64(sections[startup_section_index].contents + 8, 4, 0xf2a40010u);
+    cld_write_u64(sections[startup_section_index].contents + 12, 4, 0xd4001001u);
+    cld_write_u64(sections[startup_section_index].contents + 16, 4, CLD_ARM64_B_IMM26_ZERO);
 
     ordered_segment_count = 0;
     if (!cld_copy_name(ordered_segment_names[ordered_segment_count++], SEG_TEXT)) {
@@ -1772,14 +2436,26 @@ static bool cld_link_macho_arm64_executable(const CldMachOObject *object_files,
     }
 
     if (!options->no_stdlib) {
-        if (!cld_find_macos_libsystem_tbd(&libsystem_tbd_path, error)) {
+        if (!cld_symbol_name_set_add(&needed_dylibs,
+                                     "/usr/lib/libSystem.B.dylib",
+                                     error)) {
             goto cleanup;
         }
     }
 
     dylinker_command_size = sizeof(struct dylinker_command) + sizeof("/usr/lib/dyld");
-    dylib_command_size = options->no_stdlib ? 0 : sizeof(struct dylib_command) + sizeof("/usr/lib/libSystem.B.dylib");
-    command_count = 1 + segment_count + 1 + 1 + 1 + 1 + (options->no_stdlib ? 0 : 1) + (has_build_version ? 1 : 0);
+    if (!options->no_stdlib) {
+        for (size_t dylib_index = 0; dylib_index < needed_dylibs.count; ++dylib_index) {
+            size_t raw_size;
+            const char *dylib_name = needed_dylibs.names[dylib_index];
+            if (dylib_name == NULL || dylib_name[0] == '\0') {
+                continue;
+            }
+            raw_size = sizeof(struct dylib_command) + strlen(dylib_name) + 1;
+            dylib_commands_size += cld_aligned_command_size(raw_size);
+        }
+    }
+    command_count = 1 + segment_count + 1 + 1 + 1 + 1 + (options->no_stdlib ? 0 : needed_dylibs.count) + (has_build_version ? 1 : 0);
     load_commands_size = sizeof(struct segment_command_64)
         + sizeof(struct segment_command_64)
         + cld_load_command_size_for_segments(segments, segment_count)
@@ -1787,7 +2463,7 @@ static bool cld_link_macho_arm64_executable(const CldMachOObject *object_files,
         + sizeof(struct dysymtab_command)
         + cld_aligned_command_size(dylinker_command_size)
         + sizeof(struct entry_point_command)
-        + (options->no_stdlib ? 0 : cld_aligned_command_size(dylib_command_size))
+        + (options->no_stdlib ? 0 : dylib_commands_size)
         + (has_build_version ? sizeof(struct build_version_command) : 0);
     header_size = sizeof(struct mach_header_64) + load_commands_size + sizeof(struct linkedit_data_command);
 
@@ -1917,24 +2593,60 @@ static bool cld_link_macho_arm64_executable(const CldMachOObject *object_files,
         if ((symbols[symbol_index].type & N_EXT) == 0) {
             continue;
         }
-        if (!cld_lookup_defined_symbol_by_name(symbols, total_symbol_count, symbols[symbol_index].name, true, &symbols[symbol_index].value, error)) {
+        if (!cld_lookup_defined_symbol_by_name(symbols, total_symbol_count, symbols[symbol_index].name, true, &symbols[symbol_index].value, error) &&
+            !cld_lookup_defined_symbol_by_name(symbols, total_symbol_count, symbols[symbol_index].name, false, &symbols[symbol_index].value, error)) {
+            const char *cached_dylib;
+            char resolved_dylib[1024];
+
             if (options->no_stdlib) {
                 cld_set_error(error, "undefined symbol %s is not supported yet", symbols[symbol_index].name);
                 goto cleanup;
             }
-            needs_system_linker = true;
-            break;
+
+            cached_dylib = cld_import_cache_lookup(&import_cache, symbols[symbol_index].name);
+            if (cached_dylib == NULL) {
+                if (!cld_find_symbol_dylib_in_sdk_tbd_dir(CLD_MACOS_SDK_USR_LIB_DIR,
+                                                          symbols[symbol_index].name,
+                                                          resolved_dylib,
+                                                          sizeof(resolved_dylib),
+                                                          error)) {
+                    cld_log_nearby_defined_symbols(symbols,
+                                                   total_symbol_count,
+                                                   symbols[symbol_index].name);
+                    cld_set_error(error,
+                                  "undefined symbol %s (not found in linked objects or SDK dylib exports)",
+                                  symbols[symbol_index].name);
+                    goto cleanup;
+                }
+                if (!cld_import_cache_upsert(&import_cache,
+                                             symbols[symbol_index].name,
+                                             resolved_dylib,
+                                             error)) {
+                    goto cleanup;
+                }
+                cached_dylib = cld_import_cache_lookup(&import_cache, symbols[symbol_index].name);
+                tbd_cache_dirty = true;
+            }
+            free(symbols[symbol_index].dynamic_import_dylib);
+            symbols[symbol_index].dynamic_import_dylib = cached_dylib != NULL ? strdup(cached_dylib) : NULL;
+            if (cached_dylib != NULL && symbols[symbol_index].dynamic_import_dylib == NULL) {
+                cld_set_error(error,
+                              "out of memory recording import dylib for %s",
+                              symbols[symbol_index].name);
+                goto cleanup;
+            }
+            symbols[symbol_index].is_dynamic_import = true;
+            continue;
         }
         symbols[symbol_index].is_defined = true;
     }
 
-    if (needs_system_linker) {
-        if (libsystem_tbd_path == NULL) {
-            cld_set_error(error, "macOS system linking was requested without libSystem");
+    if (tbd_cache_dirty) {
+        if (!cld_write_sdk_tbd_cache(CLD_MACOS_SDK_TBD_CACHE_PATH,
+                                     &import_cache,
+                                     error)) {
             goto cleanup;
         }
-        success = cld_link_macho_arm64_with_system_ld(object_files, object_count, options, &build_version, libsystem_tbd_path, error);
-        goto cleanup;
     }
 
     if (!cld_lookup_defined_symbol_by_name(symbols, total_symbol_count, entry_symbol, false, &entry_value, error)) {
@@ -1948,7 +2660,16 @@ static bool cld_link_macho_arm64_executable(const CldMachOObject *object_files,
 
     entry_file_offset = sections[startup_section_index].file_offset;
 
-    if (!cld_apply_relocations(target, sections, output_section_count, object_states, symbols, error)) {
+    if (!cld_apply_relocations(target,
+                               sections,
+                               output_section_count,
+                               object_states,
+                               symbols,
+                               &sections[startup_section_index],
+                               import_stub_slots,
+                               total_symbol_count,
+                               &next_import_stub_slot,
+                               error)) {
         goto cleanup;
     }
 
@@ -2171,17 +2892,36 @@ static bool cld_link_macho_arm64_executable(const CldMachOObject *object_files,
     }
 
     if (!options->no_stdlib) {
-        struct dylib_command dylib_command;
-        uint8_t raw_command[sizeof(struct dylib_command) + sizeof("/usr/lib/libSystem.B.dylib")];
+        for (size_t dylib_index = 0; dylib_index < needed_dylibs.count; ++dylib_index) {
+            struct dylib_command dylib_command;
+            size_t dylib_name_length;
+            size_t raw_size;
+            size_t command_size;
+            uint8_t *raw_command;
+            const char *dylib_name = needed_dylibs.names[dylib_index];
 
-        memset(raw_command, 0, sizeof(raw_command));
-        memset(&dylib_command, 0, sizeof(dylib_command));
-        dylib_command.cmd = LC_LOAD_DYLIB;
-        dylib_command.cmdsize = cld_aligned_command_size(sizeof(raw_command));
-        dylib_command.dylib.name.offset = sizeof(dylib_command);
-        memcpy(raw_command, &dylib_command, sizeof(dylib_command));
-        memcpy(raw_command + sizeof(dylib_command), "/usr/lib/libSystem.B.dylib", sizeof("/usr/lib/libSystem.B.dylib"));
-        cld_write_padded_command(&command_cursor, raw_command, sizeof(raw_command));
+            if (dylib_name == NULL || dylib_name[0] == '\0') {
+                continue;
+            }
+            dylib_name_length = strlen(dylib_name) + 1;
+            raw_size = sizeof(struct dylib_command) + dylib_name_length;
+            command_size = cld_aligned_command_size(raw_size);
+            raw_command = (uint8_t *) calloc(1, command_size);
+            if (raw_command == NULL) {
+                cld_set_error(error, "out of memory creating LC_LOAD_DYLIB for %s", dylib_name);
+                goto cleanup;
+            }
+
+            memset(&dylib_command, 0, sizeof(dylib_command));
+            dylib_command.cmd = LC_LOAD_DYLIB;
+            dylib_command.cmdsize = (uint32_t) command_size;
+            dylib_command.dylib.name.offset = sizeof(dylib_command);
+            memcpy(raw_command, &dylib_command, sizeof(dylib_command));
+            memcpy(raw_command + sizeof(dylib_command), dylib_name, dylib_name_length);
+            memcpy(command_cursor, raw_command, command_size);
+            command_cursor += command_size;
+            free(raw_command);
+        }
     }
 
     if (!cld_write_entire_file(options->output_path, output_bytes, file_size, error)) {
@@ -2216,10 +2956,16 @@ cleanup:
             free(sections[section_index].contents);
         }
     }
+    for (symbol_index = 0; symbol_index < total_symbol_count; ++symbol_index) {
+        free(symbols[symbol_index].dynamic_import_dylib);
+        symbols[symbol_index].dynamic_import_dylib = NULL;
+    }
     free(output_bytes);
-    free(libsystem_tbd_path);
+    free(import_stub_slots);
+    cld_symbol_name_set_destroy(&needed_dylibs);
     free(string_bytes);
     free(symtab_bytes);
+    cld_import_cache_destroy(&import_cache);
     free(ordered_segment_names);
     free(segments);
     free(symbols);
@@ -2240,11 +2986,10 @@ bool cld_link_objects(const CldMachOObject *object_files, size_t object_count, c
     }
 
     if (options->target->object_format == CLD_OBJECT_FORMAT_ELF) {
-        if (strcmp(options->target->name, "x86_64-elf") != 0) {
-            cld_set_error(error, "ELF emission is not implemented for target %s", options->target->name);
-            return false;
-        }
-        return cld_link_x86_64_elf(object_files, object_count, options, error);
+        cld_set_error(error,
+                      "self-hosted ELF linking is not implemented for target %s (external compiler/linker fallback is disabled)",
+                      options->target->name);
+        return false;
     }
 
     if (options->output_kind == CLD_OUTPUT_KIND_RELOCATABLE) {

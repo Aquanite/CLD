@@ -39,6 +39,7 @@ static void cld_print_version(FILE *stream) {
 static void cld_print_usage(FILE *stream) {
     fprintf(stream,
             "usage: cld link <input> [more inputs ...] -o <output> [--target <target>] [--output-kind <kind>] [--entry <symbol>] [--stack-size <bytes>] [-nostdlib] [--list-targets] [-d|-vd]\n");
+    fprintf(stream, "       cld --flush-cache\n");
     fprintf(stream, "       output kinds: relocatable, executable\n");
 }
 
@@ -74,6 +75,15 @@ int main(int argc, char **argv) {
 
     if (argc == 2 && strcmp(argv[1], "--version") == 0) {
         cld_print_version(stdout);
+        return 0;
+    }
+
+    if (argc == 2 && strcmp(argv[1], "--flush-cache") == 0) {
+        if (!cld_flush_sdk_cache(&error)) {
+            fprintf(stderr, "cld: %s\n", error.message);
+            return 1;
+        }
+        fprintf(stdout, "cld: SDK import cache flushed\n");
         return 0;
     }
 
