@@ -27,6 +27,7 @@ clean:
 test: $(TARGET)
 	./tests/macos/run.sh
 	./tests/elf/run.sh
+	./tests/bslash/run.sh
 
 install: $(TARGET)
 	install -d "$(DESTDIR)$(BINDIR)"

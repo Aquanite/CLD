@@ -9,6 +9,7 @@
 typedef enum {
     CLD_OBJECT_FORMAT_MACHO,
     CLD_OBJECT_FORMAT_ELF,
+    CLD_OBJECT_FORMAT_BSO,
 } CldObjectFormat;
 
 typedef struct {
@@ -29,6 +30,7 @@ typedef struct {
 
 extern const CldTarget cld_target_macos_arm64;
 extern const CldTarget cld_target_x86_64_elf;
+extern const CldTarget cld_target_bslash;
 
 const CldTarget *cld_default_target(void);
 const CldTarget *cld_find_target(const char *name);

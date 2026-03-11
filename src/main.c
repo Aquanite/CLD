@@ -1,4 +1,5 @@
 #include "cld/linker.h"
+#include "cld/bso.h"
 #include "cld/macho.h"
 
 #include <stdio.h>
@@ -53,6 +54,7 @@ static void cld_print_debug_row(const char *key, const char *value) {
 
 int main(int argc, char **argv) {
     CldMachOObject *object_files;
+    CldBsoObject *bso_files;
     CldLinkOptions options;
     CldError error;
     const char **input_paths;
@@ -64,6 +66,7 @@ int main(int argc, char **argv) {
     int argument_index;
 
     object_files = NULL;
+    bso_files = NULL;
     input_paths = NULL;
     input_count = 0;
     parsed_object_count = 0;
@@ -200,7 +203,9 @@ int main(int argc, char **argv) {
         options.entry_symbol = options.target->object_format == CLD_OBJECT_FORMAT_ELF ? "main" : "_main";
     }
 
-    if (!options.no_stdlib && !options.target->host_native) {
+    if (!options.no_stdlib &&
+        !options.target->host_native &&
+        options.target->object_format != CLD_OBJECT_FORMAT_BSO) {
         fprintf(stderr,
                 "cld: warning: enabling -nostdlib by default because the current platform is not the target\n");
         options.no_stdlib = true;
@@ -224,29 +229,53 @@ int main(int argc, char **argv) {
         }
     }
 
-    object_files = calloc(input_count, sizeof(*object_files));
-    if (object_files == NULL) {
-        fprintf(stderr, "cld: out of memory allocating object list\n");
-        goto failure;
-    }
+    if (options.target->object_format == CLD_OBJECT_FORMAT_MACHO ||
+        options.target->object_format == CLD_OBJECT_FORMAT_ELF) {
+        object_files = calloc(input_count, sizeof(*object_files));
+        if (object_files == NULL) {
+            fprintf(stderr, "cld: out of memory allocating object list\n");
+            goto failure;
+        }
 
-    for (parsed_object_count = 0; parsed_object_count < input_count; ++parsed_object_count) {
-        if (options.target->object_format == CLD_OBJECT_FORMAT_MACHO) {
-            if (!cld_parse_macho_object(input_paths[parsed_object_count], &object_files[parsed_object_count], &error)) {
+        for (parsed_object_count = 0; parsed_object_count < input_count; ++parsed_object_count) {
+            if (options.target->object_format == CLD_OBJECT_FORMAT_MACHO) {
+                if (!cld_parse_macho_object(input_paths[parsed_object_count], &object_files[parsed_object_count], &error)) {
+                    fprintf(stderr, "cld: %s\n", error.message);
+                    goto failure;
+                }
+            } else {
+                object_files[parsed_object_count].path = strdup(input_paths[parsed_object_count]);
+                if (object_files[parsed_object_count].path == NULL) {
+                    fprintf(stderr, "cld: out of memory duplicating input path\n");
+                    goto failure;
+                }
+            }
+        }
+
+        if (!cld_link_objects(object_files, input_count, &options, &error)) {
+            fprintf(stderr, "cld: %s\n", error.message);
+            goto failure;
+        }
+    } else if (options.target->object_format == CLD_OBJECT_FORMAT_BSO) {
+        bso_files = calloc(input_count, sizeof(*bso_files));
+        if (bso_files == NULL) {
+            fprintf(stderr, "cld: out of memory allocating BSO object list\n");
+            goto failure;
+        }
+
+        for (parsed_object_count = 0; parsed_object_count < input_count; ++parsed_object_count) {
+            if (!cld_parse_bslash_object(input_paths[parsed_object_count], &bso_files[parsed_object_count], &error)) {
                 fprintf(stderr, "cld: %s\n", error.message);
                 goto failure;
             }
-        } else {
-            object_files[parsed_object_count].path = strdup(input_paths[parsed_object_count]);
-            if (object_files[parsed_object_count].path == NULL) {
-                fprintf(stderr, "cld: out of memory duplicating input path\n");
-                goto failure;
-            }
         }
-    }
 
-    if (!cld_link_objects(object_files, input_count, &options, &error)) {
-        fprintf(stderr, "cld: %s\n", error.message);
+        if (!cld_link_bso_objects(bso_files, input_count, &options, &error)) {
+            fprintf(stderr, "cld: %s\n", error.message);
+            goto failure;
+        }
+    } else {
+        fprintf(stderr, "cld: unsupported object format for target %s\n", options.target->name);
         goto failure;
     }
 
@@ -255,10 +284,18 @@ int main(int argc, char **argv) {
             options.target->name,
             options.output_path);
 
-    for (parsed_object_count = 0; parsed_object_count < input_count; ++parsed_object_count) {
-        cld_free_macho_object(&object_files[parsed_object_count]);
+    if (object_files != NULL) {
+        for (parsed_object_count = 0; parsed_object_count < input_count; ++parsed_object_count) {
+            cld_free_macho_object(&object_files[parsed_object_count]);
+        }
+    }
+    if (bso_files != NULL) {
+        for (parsed_object_count = 0; parsed_object_count < input_count; ++parsed_object_count) {
+            cld_free_bso_object(&bso_files[parsed_object_count]);
+        }
     }
     free(object_files);
+    free(bso_files);
     free(input_paths);
     return 0;
 
@@ -268,7 +305,14 @@ failure:
             cld_free_macho_object(&object_files[object_index]);
         }
     }
+    if (bso_files != NULL) {
+        for (size_t object_index = 0; object_index < parsed_object_count; ++object_index) {
+            cld_free_bso_object(&bso_files[object_index]);
+        }
+    }
     free(object_files);
+    free(bso_files);
     free(input_paths);
     return 1;
 }
+
