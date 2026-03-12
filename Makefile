@@ -1,5 +1,5 @@
 CC := clang
-CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -O2 -Iinclude
+CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -O2 -Iinclude -MMD -MP
 LDFLAGS :=
 BUILD_DIR := build
 TARGET := $(BUILD_DIR)/cld
@@ -8,6 +8,7 @@ BINDIR ?= $(PREFIX)/bin
 DESTDIR ?=
 SOURCES := $(wildcard src/*.c)
 OBJECTS := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SOURCES))
+DEPS := $(OBJECTS:.o=.d)
 
 .PHONY: all clean test install uninstall
 
@@ -35,3 +36,5 @@ install: $(TARGET)
 
 uninstall:
 	rm -f "$(DESTDIR)$(BINDIR)/cld"
+
+-include $(DEPS)

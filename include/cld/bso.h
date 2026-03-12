@@ -36,6 +36,7 @@ typedef struct {
     char *path;
     uint8_t *data;
     size_t size;
+    char *owned_string_table;
     const uint8_t *code;
     uint32_t code_size;
     const char *string_table;

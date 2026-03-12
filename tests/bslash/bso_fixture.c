@@ -229,6 +229,90 @@ static void check_bin(const char *path) {
     }
 }
 
+static void check_roundtrip_bso(const char *path) {
+    FILE *file;
+    bso_header_t header;
+    uint8_t code[16];
+    bso_symbol_record_t symbols[2];
+    bso_relocation_record_t relocation;
+    uint8_t strings[22];
+
+    file = fopen(path, "rb");
+    if (file == NULL) {
+        fail("failed to open roundtrip BSO output");
+    }
+    if (fread(&header, sizeof(header), 1, file) != 1) {
+        fail("failed to read roundtrip BSO header");
+    }
+    if (header.version != BSO_VERSION ||
+        memcmp(header.magic, "BSO1", 4) != 0 ||
+        header.code_size != 16 ||
+        header.symbol_count != 2 ||
+        header.relocation_count != 1 ||
+        header.string_table_size != 22) {
+        fail("roundtrip BSO header mismatch");
+    }
+    if (fread(code, 1, sizeof(code), file) != sizeof(code)) {
+        fail("failed to read roundtrip BSO code");
+    }
+    if (fread(symbols, sizeof(symbols[0]), 2, file) != 2) {
+        fail("failed to read roundtrip BSO symbols");
+    }
+    if (fread(&relocation, sizeof(relocation), 1, file) != 1) {
+        fail("failed to read roundtrip BSO relocation");
+    }
+    if (fread(strings, 1, sizeof(strings), file) != sizeof(strings)) {
+        fail("failed to read roundtrip BSO strings");
+    }
+    fclose(file);
+
+    if (memcmp(code,
+               "\x16\x00\x28\x00\x00\x00\x29\xf5\xff\xff\xff\x37\x07\x00\x02\x26",
+               sizeof(code)) != 0) {
+        fail("roundtrip BSO code mismatch");
+    }
+    if (symbols[0].name_offset != 1 ||
+        symbols[0].value != 0 ||
+        symbols[0].flags != (BSO_SYMBOL_GLOBAL | BSO_SYMBOL_DEFINED)) {
+        fail("roundtrip BSO first symbol mismatch");
+    }
+    if (symbols[1].name_offset != 7 ||
+        symbols[1].value != 12 ||
+        symbols[1].flags != (BSO_SYMBOL_GLOBAL | BSO_SYMBOL_DEFINED)) {
+        fail("roundtrip BSO second symbol mismatch");
+    }
+    if (relocation.offset != 7 ||
+        relocation.addend != -11 ||
+        relocation.symbol_index != 1 ||
+        relocation.kind != 6) {
+        fail("roundtrip BSO relocation mismatch");
+    }
+    if (strcmp(string_at(strings, sizeof(strings), 1), "start") != 0 ||
+        strcmp(string_at(strings, sizeof(strings), 7), "helper_add_two") != 0) {
+        fail("roundtrip BSO string table mismatch");
+    }
+}
+
+static void check_roundtrip_bin(const char *path) {
+    FILE *file;
+    uint8_t bytes[16];
+
+    file = fopen(path, "rb");
+    if (file == NULL) {
+        fail("failed to open roundtrip BSO executable");
+    }
+    if (fread(bytes, 1, sizeof(bytes), file) != sizeof(bytes)) {
+        fail("failed to read roundtrip BSO executable");
+    }
+    fclose(file);
+
+    if (memcmp(bytes,
+               "\x16\x00\x28\x00\x00\x00\x29\x01\x00\x00\x00\x37\x07\x00\x02\x26",
+               sizeof(bytes)) != 0) {
+        fail("roundtrip BSO executable mismatch");
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc != 3) {
         fail("usage: bso_fixture <command> <path>");
@@ -256,6 +340,14 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "check-bin") == 0) {
         check_bin(argv[2]);
+        return 0;
+    }
+    if (strcmp(argv[1], "check-roundtrip-bso") == 0) {
+        check_roundtrip_bso(argv[2]);
+        return 0;
+    }
+    if (strcmp(argv[1], "check-roundtrip-bin") == 0) {
+        check_roundtrip_bin(argv[2]);
         return 0;
     }
 

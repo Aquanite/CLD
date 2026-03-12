@@ -205,6 +205,28 @@ static bool cld_bso_init_normalized_object(CldBsoObject *object_file,
     return true;
 }
 
+static bool cld_bso_copy_string_table(CldBsoObject *object_file,
+                                      const char *source,
+                                      uint32_t source_size,
+                                      CldError *error) {
+    if (source_size == 0) {
+        object_file->owned_string_table = NULL;
+        object_file->string_table = NULL;
+        object_file->string_table_size = 0;
+        return true;
+    }
+
+    object_file->owned_string_table = malloc(source_size);
+    if (object_file->owned_string_table == NULL) {
+        cld_set_error(error, "out of memory allocating normalized BSlash string table");
+        return false;
+    }
+    memcpy(object_file->owned_string_table, source, source_size);
+    object_file->string_table = object_file->owned_string_table;
+    object_file->string_table_size = source_size;
+    return true;
+}
+
 static bool cld_parse_bslash_macho_object(const char *path,
                                           CldBsoObject *object_file,
                                           CldError *error) {
@@ -214,7 +236,7 @@ static bool cld_parse_bslash_macho_object(const char *path,
     const struct symtab_command *symtab_command;
     const struct section_64 *code_section;
     const struct relocation_info *relocations;
-    const struct nlist_64 *symbol_table;
+    const uint8_t *symbol_table_bytes;
     const char *string_table;
     const uint8_t *cursor;
     uint32_t command_index;
@@ -224,6 +246,7 @@ static bool cld_parse_bslash_macho_object(const char *path,
     size_t symbol_index;
     size_t relocation_index;
     size_t *symbol_index_map;
+    uint32_t normalized_string_table_size;
     bool success;
 
     file_data = NULL;
@@ -316,7 +339,7 @@ static bool cld_parse_bslash_macho_object(const char *path,
         goto cleanup;
     }
 
-    symbol_table = (const struct nlist_64 *) (file_data + symtab_command->symoff);
+    symbol_table_bytes = file_data + symtab_command->symoff;
     string_table = (const char *) (file_data + symtab_command->stroff);
     symbol_index_map = malloc(symtab_command->nsyms * sizeof(*symbol_index_map));
     if (symtab_command->nsyms != 0 && symbol_index_map == NULL) {
@@ -326,14 +349,16 @@ static bool cld_parse_bslash_macho_object(const char *path,
 
     output_symbol_count = 0;
     for (symbol_index = 0; symbol_index < symtab_command->nsyms; ++symbol_index) {
-        const struct nlist_64 *symbol;
+        struct nlist_64 symbol;
 
-        symbol = &symbol_table[symbol_index];
+        memcpy(&symbol,
+               symbol_table_bytes + symbol_index * sizeof(symbol),
+               sizeof(symbol));
         symbol_index_map[symbol_index] = SIZE_MAX;
-        if ((symbol->n_type & N_STAB) != 0) {
+        if ((symbol.n_type & N_STAB) != 0) {
             continue;
         }
-        if (symbol->n_un.n_strx >= symtab_command->strsize) {
+        if (symbol.n_un.n_strx >= symtab_command->strsize) {
             cld_set_error(error, "%s contains a Mach-O symbol with an invalid string index", path);
             goto cleanup;
         }
@@ -351,37 +376,46 @@ static bool cld_parse_bslash_macho_object(const char *path,
         goto cleanup;
     }
     memcpy(object_file->data, file_data + code_section->offset, (size_t) code_section->size);
+    normalized_string_table_size = symtab_command->strsize;
+    if (!cld_bso_copy_string_table(object_file,
+                                   string_table,
+                                   normalized_string_table_size,
+                                   error)) {
+        goto cleanup;
+    }
 
     output_symbol_count = 0;
     for (symbol_index = 0; symbol_index < symtab_command->nsyms; ++symbol_index) {
-        const struct nlist_64 *symbol;
+        struct nlist_64 symbol;
         uint8_t symbol_type;
 
         if (symbol_index_map[symbol_index] == SIZE_MAX) {
             continue;
         }
-        symbol = &symbol_table[symbol_index];
-        symbol_type = symbol->n_type & N_TYPE;
-        object_file->symbols[output_symbol_count].name_offset = symbol->n_un.n_strx;
-        object_file->symbols[output_symbol_count].name = string_table + symbol->n_un.n_strx;
-        object_file->symbols[output_symbol_count].flags = (symbol->n_type & N_EXT) != 0 ? CLD_BSO_SYMBOL_GLOBAL : 0;
+        memcpy(&symbol,
+               symbol_table_bytes + symbol_index * sizeof(symbol),
+               sizeof(symbol));
+        symbol_type = symbol.n_type & N_TYPE;
+        object_file->symbols[output_symbol_count].name_offset = symbol.n_un.n_strx;
+        object_file->symbols[output_symbol_count].name = object_file->string_table + symbol.n_un.n_strx;
+        object_file->symbols[output_symbol_count].flags = (symbol.n_type & N_EXT) != 0 ? CLD_BSO_SYMBOL_GLOBAL : 0;
 
         if (symbol_type == N_UNDF) {
             object_file->symbols[output_symbol_count].value = 0;
         } else if (symbol_type == N_ABS) {
             object_file->symbols[output_symbol_count].flags |= CLD_BSO_SYMBOL_DEFINED;
-            object_file->symbols[output_symbol_count].value = (uint32_t) symbol->n_value;
+            object_file->symbols[output_symbol_count].value = (uint32_t) symbol.n_value;
         } else if (symbol_type == N_SECT) {
-            if (symbol->n_sect == 0) {
+            if (symbol.n_sect == 0) {
                 cld_set_error(error, "%s contains a BSlash Mach-O symbol without a section", path);
                 goto cleanup;
             }
             object_file->symbols[output_symbol_count].flags |= CLD_BSO_SYMBOL_DEFINED;
-            if (symbol->n_value < code_section->addr || symbol->n_value > code_section->addr + code_section->size) {
+            if (symbol.n_value < code_section->addr || symbol.n_value > code_section->addr + code_section->size) {
                 cld_set_error(error, "%s contains a BSlash Mach-O symbol outside the code section", path);
                 goto cleanup;
             }
-            object_file->symbols[output_symbol_count].value = (uint32_t) (symbol->n_value - code_section->addr);
+            object_file->symbols[output_symbol_count].value = (uint32_t) (symbol.n_value - code_section->addr);
         } else {
             cld_set_error(error, "%s contains unsupported BSlash Mach-O symbol type %u", path, symbol_type);
             goto cleanup;
@@ -481,6 +515,7 @@ static bool cld_parse_bslash_elf_object(const char *path,
     size_t *symbol_index_map;
     size_t output_symbol_count;
     size_t output_relocation_count;
+    uint32_t normalized_string_table_size;
     size_t section_index;
     size_t symbol_index;
     size_t relocation_write_index;
@@ -627,6 +662,13 @@ static bool cld_parse_bslash_elf_object(const char *path,
         goto cleanup;
     }
     memcpy(object_file->data, file_data + code_section->sh_offset, (size_t) code_section->sh_size);
+    normalized_string_table_size = (uint32_t) strtab_section->sh_size;
+    if (!cld_bso_copy_string_table(object_file,
+                                   (const char *) (file_data + strtab_section->sh_offset),
+                                   normalized_string_table_size,
+                                   error)) {
+        goto cleanup;
+    }
 
     output_symbol_count = 0;
     for (symbol_index = 1; symbol_index < symbol_table_count; ++symbol_index) {
@@ -634,7 +676,7 @@ static bool cld_parse_bslash_elf_object(const char *path,
         const char *name;
 
         symbol = &symbols[symbol_index];
-        name = (const char *) (file_data + strtab_section->sh_offset + symbol->st_name);
+        name = object_file->string_table + symbol->st_name;
         object_file->symbols[output_symbol_count].name = name;
         object_file->symbols[output_symbol_count].name_offset = symbol->st_name;
         object_file->symbols[output_symbol_count].flags = cld_elf64_st_bind(symbol->st_info) == 0 ? 0 : CLD_BSO_SYMBOL_GLOBAL;
@@ -915,6 +957,7 @@ void cld_free_bso_object(CldBsoObject *object_file) {
 
     free(object_file->path);
     free(object_file->data);
+    free(object_file->owned_string_table);
     free(object_file->symbols);
     free(object_file->relocations);
     memset(object_file, 0, sizeof(*object_file));
