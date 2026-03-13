@@ -4,7 +4,6 @@
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
 #include <mach/machine.h>
-#include <spawn.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -13,12 +12,20 @@
 #include <dirent.h>
 #include <errno.h>
 #include <ctype.h>
-#include <unistd.h>
 #include <sys/stat.h>
+
+#if defined(_WIN32)
+#include <io.h>
+#ifndef unlink
+#define unlink _unlink
+#endif
+#else
+#include <spawn.h>
+#include <unistd.h>
 #include <sys/wait.h>
 #include <dlfcn.h>
-
 extern char **environ;
+#endif
 
 #define CLD_ARM64_RELOCATION_PAGE_SIZE 0x1000ull
 
@@ -874,6 +881,11 @@ bool cld_flush_sdk_cache(CldError *error) {
 
 
 static bool cld_run_codesign(const char *output_path, CldError *error) {
+#if defined(_WIN32)
+    (void) output_path;
+    (void) error;
+    return true;
+#else
     pid_t process_id;
     int spawn_status;
     int wait_status;
@@ -902,6 +914,7 @@ static bool cld_run_codesign(const char *output_path, CldError *error) {
     }
 
     return true;
+#endif
 }
 
 static bool cld_fixup_codesign_load_commands(const char *output_path, CldError *error) {
@@ -1418,6 +1431,12 @@ static bool cld_apply_relocations(const CldTarget *target,
                         }
 
                         host_symbol_ptr = NULL;
+#if defined(_WIN32)
+                        cld_set_error(error,
+                                      "dynamic import host resolution is not supported on Windows for symbol %s",
+                                      symbols[resolved_symbol_index].name);
+                        return false;
+#else
                         if (symbols[resolved_symbol_index].dynamic_import_dylib != NULL &&
                             symbols[resolved_symbol_index].dynamic_import_dylib[0] != '\0') {
                             void *import_handle;
@@ -1447,6 +1466,7 @@ static bool cld_apply_relocations(const CldTarget *target,
                                           symbols[resolved_symbol_index].name);
                             return false;
                         }
+#endif
 
                         host_symbol_address = (uint64_t) (uintptr_t) host_symbol_ptr;
                         stub_slot = *next_import_stub_slot;

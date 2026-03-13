@@ -5,6 +5,24 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#if defined(_WIN32)
+#include <stdlib.h>
+#include <string.h>
+#ifndef strdup
+#define strdup _strdup
+#endif
+#ifndef HAVE_STRNLEN
+static inline size_t cld_strnlen_fallback(const char *value, size_t max_len) {
+    size_t len = 0;
+    while (len < max_len && value[len] != '\0') {
+        ++len;
+    }
+    return len;
+}
+#define strnlen cld_strnlen_fallback
+#endif
+#endif
+
 #define CLD_NAME_CAPACITY 17
 
 typedef struct {
