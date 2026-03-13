@@ -43,6 +43,9 @@ typedef struct {
     bool is_defined;
 } CldBsoResolvedSymbol;
 
+#define CLD_BSLASH_DEFAULT_IMAGE_BASE 0xA0000000ull
+#define CLD_BSLASH_SYNTHETIC_END_SYMBOL "_cld_end"
+
 const CldTarget cld_target_bslash = {
     .name = "bslash",
     .object_format = CLD_OBJECT_FORMAT_BSO,
@@ -53,7 +56,7 @@ const CldTarget cld_target_bslash = {
     .minos = 0,
     .sdk = 0,
     .page_size = 1,
-    .image_base = 0,
+    .image_base = CLD_BSLASH_DEFAULT_IMAGE_BASE,
     .page_zero_size = 0,
     .default_stack_size = 0,
     .stack_top = 0,
@@ -71,6 +74,28 @@ static size_t cld_bso_find_symbol_index(const CldBsoResolvedSymbol *symbols,
     }
 
     return SIZE_MAX;
+}
+
+static void cld_bso_define_synthetic_end_symbol(CldBsoResolvedSymbol *symbols,
+                                                 size_t symbol_count,
+                                                 uint32_t image_end_offset) {
+    size_t symbol_index;
+
+    symbol_index = cld_bso_find_symbol_index(symbols,
+                                             symbol_count,
+                                             CLD_BSLASH_SYNTHETIC_END_SYMBOL);
+    if (symbol_index == SIZE_MAX) {
+        return;
+    }
+
+    if (symbols[symbol_index].is_defined) {
+        return;
+    }
+
+    symbols[symbol_index].is_defined = true;
+    symbols[symbol_index].value = image_end_offset;
+    symbols[symbol_index].flags |= CLD_BSO_SYMBOL_DEFINED;
+    symbols[symbol_index].source_path = "<synthetic>";
 }
 
 static bool cld_bso_range_is_valid(size_t size, uint32_t offset, uint32_t width) {
@@ -173,8 +198,39 @@ static bool cld_bso_add_resolved_symbol(CldBsoResolvedSymbol **symbols,
     return true;
 }
 
+static size_t cld_bso_find_object_with_symbol(const CldBsoObject *object_files,
+                                              size_t object_count,
+                                              const char *symbol_name) {
+    size_t object_index;
+
+    if (object_files == NULL || symbol_name == NULL || symbol_name[0] == '\0') {
+        return SIZE_MAX;
+    }
+
+    for (object_index = 0; object_index < object_count; ++object_index) {
+        const CldBsoObject *object_file;
+        size_t symbol_index;
+
+        object_file = &object_files[object_index];
+        for (symbol_index = 0; symbol_index < object_file->symbol_count; ++symbol_index) {
+            const CldBsoSymbol *symbol;
+
+            symbol = &object_file->symbols[symbol_index];
+            if ((symbol->flags & CLD_BSO_SYMBOL_DEFINED) == 0) {
+                continue;
+            }
+            if (strcmp(symbol->name, symbol_name) == 0) {
+                return object_index;
+            }
+        }
+    }
+
+    return SIZE_MAX;
+}
+
 static bool cld_bso_collect_objects(const CldBsoObject *object_files,
                                     size_t object_count,
+                                    size_t preferred_first_object,
                                     CldBsoObjectState **object_states_out,
                                     CldBsoResolvedSymbol **symbols_out,
                                     size_t *symbol_count_out,
@@ -182,6 +238,7 @@ static bool cld_bso_collect_objects(const CldBsoObject *object_files,
                                     size_t *contents_size_out,
                                     CldError *error) {
     CldBsoObjectState *object_states;
+    size_t *object_order;
     CldBsoResolvedSymbol *symbols;
     size_t symbol_count;
     size_t symbol_capacity;
@@ -190,6 +247,7 @@ static bool cld_bso_collect_objects(const CldBsoObject *object_files,
     size_t object_index;
 
     object_states = calloc(object_count, sizeof(*object_states));
+    object_order = NULL;
     symbols = NULL;
     symbol_count = 0;
     symbol_capacity = 0;
@@ -201,11 +259,32 @@ static bool cld_bso_collect_objects(const CldBsoObject *object_files,
         return false;
     }
 
+    if (object_count > 0) {
+        object_order = malloc(object_count * sizeof(*object_order));
+        if (object_order == NULL) {
+            cld_set_error(error, "out of memory allocating BSO object order");
+            goto failure;
+        }
+
+        size_t write_index = 0;
+        if (preferred_first_object != SIZE_MAX && preferred_first_object < object_count) {
+            object_order[write_index++] = preferred_first_object;
+        }
+        for (object_index = 0; object_index < object_count; ++object_index) {
+            if (object_index == preferred_first_object) {
+                continue;
+            }
+            object_order[write_index++] = object_index;
+        }
+    }
+
     for (object_index = 0; object_index < object_count; ++object_index) {
         const CldBsoObject *object_file;
         size_t input_symbol_index;
+        size_t source_index;
 
-        object_file = &object_files[object_index];
+        source_index = object_order != NULL ? object_order[object_index] : object_index;
+        object_file = &object_files[source_index];
         if (contents_size > SIZE_MAX - object_file->code_size) {
             cld_set_error(error, "BSO output exceeds addressable size");
             goto failure;
@@ -261,6 +340,7 @@ static bool cld_bso_collect_objects(const CldBsoObject *object_files,
     *symbol_count_out = symbol_count;
     *contents_out = contents;
     *contents_size_out = contents_size;
+    free(object_order);
     return true;
 
 failure:
@@ -269,6 +349,7 @@ failure:
             free(object_states[object_index].symbol_map);
         }
     }
+    free(object_order);
     free(contents);
     free(symbols);
     free(object_states);
@@ -417,6 +498,7 @@ static bool cld_bso_emit_relocatable(const CldBsoObject *object_files,
 
     if (!cld_bso_collect_objects(object_files,
                                  object_count,
+                                 SIZE_MAX,
                                  &object_states,
                                  &symbols,
                                  &symbol_count,
@@ -508,6 +590,7 @@ static bool cld_bso_apply_relocations(uint8_t *contents,
                                       const CldBsoObjectState *object_states,
                                       size_t object_count,
                                       const CldBsoResolvedSymbol *symbols,
+                                      uint64_t image_base,
                                       CldError *error) {
     size_t object_index;
 
@@ -545,6 +628,7 @@ static bool cld_bso_apply_relocations(uint8_t *contents,
 
             value = (int64_t) symbol->value + relocation->addend;
             if (relative) {
+                value -= (int64_t) object_states[object_index].base_offset;
                 if (width == 1) {
                     if (value < INT8_MIN || value > INT8_MAX) {
                         cld_set_error(error, "relative 8-bit relocation for %s is out of range", symbol->name);
@@ -563,6 +647,8 @@ static bool cld_bso_apply_relocations(uint8_t *contents,
                 }
                 continue;
             }
+
+            value += (int64_t) image_base;
 
             if (value < 0) {
                 cld_set_error(error, "absolute relocation for %s resolved to a negative value", symbol->name);
@@ -623,8 +709,14 @@ static bool cld_bso_emit_executable(const CldBsoObject *object_files,
     contents_size = 0;
     success = false;
 
+    size_t preferred_first_object = cld_bso_find_object_with_symbol(object_files, object_count, "_start");
+    if (preferred_first_object == SIZE_MAX) {
+        preferred_first_object = cld_bso_find_object_with_symbol(object_files, object_count, "start");
+    }
+
     if (!cld_bso_collect_objects(object_files,
                                  object_count,
+                                 preferred_first_object,
                                  &object_states,
                                  &symbols,
                                  &symbol_count,
@@ -633,6 +725,10 @@ static bool cld_bso_emit_executable(const CldBsoObject *object_files,
                                  error)) {
         goto cleanup;
     }
+
+    cld_bso_define_synthetic_end_symbol(symbols,
+                                        symbol_count,
+                                        (uint32_t) contents_size);
 
     for (object_index = 0; object_index < symbol_count; ++object_index) {
         if ((symbols[object_index].flags & CLD_BSO_SYMBOL_GLOBAL) == 0) {
@@ -649,6 +745,7 @@ static bool cld_bso_emit_executable(const CldBsoObject *object_files,
                                    object_states,
                                    object_count,
                                    symbols,
+                                   options->target->image_base,
                                    error)) {
         goto cleanup;
     }
