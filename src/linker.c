@@ -9,17 +9,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <dirent.h>
 #include <errno.h>
 #include <ctype.h>
 #include <sys/stat.h>
 
 #if defined(_WIN32)
 #include <io.h>
+#include <stddef.h>
+#ifndef ssize_t
+typedef ptrdiff_t ssize_t;
+#endif
 #ifndef unlink
 #define unlink _unlink
 #endif
 #else
+#include <dirent.h>
 #include <spawn.h>
 #include <unistd.h>
 #include <sys/wait.h>
@@ -497,6 +501,14 @@ static bool cld_find_symbol_dylib_in_sdk_tbd_dir(const char *sdk_lib_dir,
                                                  char *out_dylib,
                                                  size_t out_dylib_size,
                                                  CldError *error) {
+#if defined(_WIN32)
+    (void) sdk_lib_dir;
+    (void) requested_symbol;
+    (void) out_dylib;
+    (void) out_dylib_size;
+    cld_set_error(error, "SDK .tbd directory scanning is not supported on Windows");
+    return false;
+#else
     DIR *directory;
     struct dirent *entry;
 
@@ -620,12 +632,20 @@ static bool cld_find_symbol_dylib_in_sdk_tbd_dir(const char *sdk_lib_dir,
 
     closedir(directory);
     return false;
+#endif
 }
 
 static bool cld_load_sdk_tbd_exports_and_dylibs(const char *sdk_lib_dir,
                                                 CldSymbolNameSet *exports,
                                                 CldSymbolNameSet *dylibs,
                                                 CldError *error) {
+#if defined(_WIN32)
+    (void) sdk_lib_dir;
+    (void) exports;
+    (void) dylibs;
+    cld_set_error(error, "SDK .tbd export scanning is not supported on Windows");
+    return false;
+#else
     DIR *directory;
     struct dirent *entry;
 
@@ -772,6 +792,7 @@ static bool cld_load_sdk_tbd_exports_and_dylibs(const char *sdk_lib_dir,
 
     closedir(directory);
     return true;
+#endif
 }
 
 static bool cld_load_sdk_tbd_cache(const char *cache_path,
