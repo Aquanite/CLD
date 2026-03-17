@@ -153,6 +153,27 @@ static void emit_dup_b(const char *path) {
                sizeof(strings));
 }
 
+static void emit_cld_end_ref(const char *path) {
+    static const uint8_t code[] = {0x00, 0x00, 0x00, 0x00};
+    static const uint8_t strings[] = {0x00, '_', 'c', 'l', 'd', '_', 'e', 'n', 'd', 0x00};
+    static const bso_symbol_record_t symbols[] = {
+        {1, 0, BSO_SYMBOL_GLOBAL},
+    };
+    static const bso_relocation_record_t relocations[] = {
+        {0, 0, 0, BSO_RELOC_ABS32},
+    };
+
+    write_file(path,
+               code,
+               sizeof(code),
+               symbols,
+               sizeof(symbols) / sizeof(symbols[0]),
+               relocations,
+               sizeof(relocations) / sizeof(relocations[0]),
+               strings,
+               sizeof(strings));
+}
+
 static const char *string_at(const uint8_t *strings, uint32_t string_size, uint32_t offset) {
     if (offset >= string_size) {
         fail("invalid string offset in BSO file");
@@ -313,6 +334,24 @@ static void check_roundtrip_bin(const char *path) {
     }
 }
 
+static void check_cld_end_bin(const char *path) {
+    FILE *file;
+    uint8_t bytes[8];
+
+    file = fopen(path, "rb");
+    if (file == NULL) {
+        fail("failed to open _cld_end executable output");
+    }
+    if (fread(bytes, 1, sizeof(bytes), file) != sizeof(bytes)) {
+        fail("failed to read _cld_end executable output");
+    }
+    fclose(file);
+
+    if (memcmp(bytes, "\x08\x00\x00\xA0\x11\x22\x33\x44", sizeof(bytes)) != 0) {
+        fail("_cld_end executable relocation mismatch");
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc != 3) {
         fail("usage: bso_fixture <command> <path>");
@@ -334,6 +373,10 @@ int main(int argc, char **argv) {
         emit_dup_b(argv[2]);
         return 0;
     }
+    if (strcmp(argv[1], "emit-cld-end-ref") == 0) {
+        emit_cld_end_ref(argv[2]);
+        return 0;
+    }
     if (strcmp(argv[1], "check-merged") == 0) {
         check_merged(argv[2]);
         return 0;
@@ -348,6 +391,10 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "check-roundtrip-bin") == 0) {
         check_roundtrip_bin(argv[2]);
+        return 0;
+    }
+    if (strcmp(argv[1], "check-cld-end-bin") == 0) {
+        check_cld_end_bin(argv[2]);
         return 0;
     }
 
