@@ -1084,8 +1084,6 @@ static bool cld_lookup_defined_symbol_by_name(const CldResolvedSymbol *symbols,
             continue;
         }
         if (found) {
-            /* Keep the first matching definition. Some generated object sets
-               can contain duplicate non-external entries for the same name. */
             continue;
         }
 
@@ -1306,7 +1304,6 @@ static bool cld_patch_pageoff12(uint8_t *contents, uint64_t target, uint32_t len
     instruction = (uint32_t) cld_read_u64(contents, 4);
     offset_in_page = target & (page_size - 1u);
     if ((instruction & 0x1f000000u) == 0x11000000u) {
-        /* add/sub (immediate): imm12 is unscaled */
         scale = 1ull;
     } else {
         scale = 1ull << length;
