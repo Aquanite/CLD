@@ -279,10 +279,12 @@ int main(int argc, char **argv) {
         goto failure;
     }
 
-    fprintf(stdout, "cld: wrote %s output for target %s to %s\n",
-            cld_output_kind_name(options.output_kind),
-            options.target->name,
-            options.output_path);
+    if (debug_deep) {
+        fprintf(stdout, "cld: wrote %s output for target %s to %s\n",
+                cld_output_kind_name(options.output_kind),
+                options.target->name,
+                options.output_path);
+    }
 
     if (object_files != NULL) {
         for (parsed_object_count = 0; parsed_object_count < input_count; ++parsed_object_count) {
