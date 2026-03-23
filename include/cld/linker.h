@@ -24,6 +24,7 @@ typedef struct {
 } CldLinkOptions;
 
 bool cld_link_objects(const CldMachOObject *object_files, size_t object_count, const CldLinkOptions *options, CldError *error);
+bool cld_link_elf_like_objects(const CldMachOObject *object_files, size_t object_count, const CldLinkOptions *options, CldError *error);
 bool cld_link_bso_objects(const CldBsoObject *object_files, size_t object_count, const CldLinkOptions *options, CldError *error);
 bool cld_flush_sdk_cache(CldError *error);
 

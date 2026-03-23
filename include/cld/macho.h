@@ -35,6 +35,8 @@ typedef struct {
     char *path;
     uint8_t *data;
     size_t size;
+    cpu_type_t cputype;
+    cpu_subtype_t cpusubtype;
     uint32_t header_flags;
     bool has_build_version;
     struct build_version_command build_version;

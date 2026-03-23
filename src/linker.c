@@ -1,6 +1,7 @@
 #include "cld/linker.h"
 
 #include <mach-o/arm64/reloc.h>
+#include <mach-o/x86_64/reloc.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
 #include <mach/machine.h>
@@ -12,6 +13,7 @@
 #include <errno.h>
 #include <ctype.h>
 #include <sys/stat.h>
+#include <signal.h>
 
 #if defined(_WIN32)
 #include <io.h>
@@ -24,7 +26,9 @@ typedef ptrdiff_t ssize_t;
 #endif
 #else
 #include <dirent.h>
+#include <fcntl.h>
 #include <spawn.h>
+#include <sys/select.h>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <dlfcn.h>
@@ -51,6 +55,7 @@ typedef struct {
     uint32_t relocation_offset;
     uint8_t *contents;
     struct relocation_info *owned_relocations;
+    size_t *relocation_owner_objects;
     uint32_t relocation_capacity;
     uint32_t relocation_count;
     const struct relocation_info *relocations;
@@ -103,12 +108,22 @@ typedef struct {
 #define CLD_MACOS_SDK_USR_LIB_DIR "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/lib"
 #define CLD_MACOS_SDK_TBD_CACHE_PATH "/tmp/cld_macos_sdk_tbd_cache_v1.txt"
 #define CLD_MACOS_SDK_TBD_CACHE_HEADER "CLD_TBD_CACHE_V1"
-#define CLD_STARTUP_PROLOGUE_SIZE 20u
-#define CLD_IMPORT_STUB_SIZE 16u
+#define CLD_ARM64_STARTUP_PROLOGUE_SIZE 20u
+#define CLD_X86_64_STARTUP_PROLOGUE_SIZE 24u
+#define CLD_ARM64_IMPORT_STUB_SIZE 16u
+#define CLD_X86_64_IMPORT_STUB_SIZE 16u
 #define CLD_IMPORT_STUB_CAPACITY 4096u
 #define CLD_ARM64_LDR_LITERAL_X16_PLUS8 0x58000050u
 #define CLD_ARM64_BR_X16 0xd61f0200u
 #define CLD_ARM64_B_IMM26_ZERO 0x14000000u
+
+#if defined(__x86_64__)
+#define CLD_HOST_CPU_TYPE CPU_TYPE_X86_64
+#elif defined(__aarch64__) || defined(__arm64__)
+#define CLD_HOST_CPU_TYPE CPU_TYPE_ARM64
+#else
+#define CLD_HOST_CPU_TYPE 0
+#endif
 
 typedef struct {
     uint32_t output_section_index;
@@ -139,12 +154,60 @@ const CldTarget cld_target_macos_arm64 = {
     .stack_top = 0,
 };
 
+const CldTarget cld_target_macos_x86_64 = {
+    .name = "macos-x86_64",
+    .object_format = CLD_OBJECT_FORMAT_MACHO,
+    .host_native = true,
+    .cpu_type = CPU_TYPE_X86_64,
+    .cpu_subtype = CPU_SUBTYPE_X86_64_ALL,
+    .platform = PLATFORM_MACOS,
+    .minos = 0x000f0000,
+    .sdk = 0,
+    .page_size = 0x1000,
+    .image_base = 0x100000000ull,
+    .page_zero_size = 0x100000000ull,
+    .default_stack_size = 0,
+    .stack_top = 0,
+};
+
 const CldTarget cld_target_x86_64_elf = {
     .name = "x86_64-elf",
     .object_format = CLD_OBJECT_FORMAT_ELF,
     .host_native = false,
     .cpu_type = CPU_TYPE_X86_64,
     .cpu_subtype = CPU_SUBTYPE_X86_64_ALL,
+    .platform = 0,
+    .minos = 0,
+    .sdk = 0,
+    .page_size = 0x1000,
+    .image_base = 0x400000,
+    .page_zero_size = 0,
+    .default_stack_size = 0,
+    .stack_top = 0,
+};
+
+const CldTarget cld_target_arm64_elf = {
+    .name = "arm64-elf",
+    .object_format = CLD_OBJECT_FORMAT_ELF,
+    .host_native = false,
+    .cpu_type = CPU_TYPE_ARM64,
+    .cpu_subtype = CPU_SUBTYPE_ARM64_ALL,
+    .platform = 0,
+    .minos = 0,
+    .sdk = 0,
+    .page_size = 0x1000,
+    .image_base = 0x400000,
+    .page_zero_size = 0,
+    .default_stack_size = 0,
+    .stack_top = 0,
+};
+
+const CldTarget cld_target_arm64_windows = {
+    .name = "arm64-windows",
+    .object_format = CLD_OBJECT_FORMAT_ELF,
+    .host_native = false,
+    .cpu_type = CPU_TYPE_ARM64,
+    .cpu_subtype = CPU_SUBTYPE_ARM64_ALL,
     .platform = 0,
     .minos = 0,
     .sdk = 0,
@@ -239,6 +302,39 @@ static ssize_t cld_find_output_section(const CldOutputSection *sections,
     }
 
     return -1;
+}
+
+static bool cld_sections_are_merge_compatible(const CldOutputSection *output_section,
+                                              const CldInputSection *input_section) {
+    uint32_t output_type;
+    uint32_t input_type;
+    bool input_zero_fill;
+
+    output_type = output_section->flags & SECTION_TYPE;
+    input_type = input_section->flags & SECTION_TYPE;
+    input_zero_fill = (input_type == S_ZEROFILL);
+
+    if (output_type != input_type) {
+        return false;
+    }
+    if (output_section->reserved1 != input_section->reserved1 ||
+        output_section->reserved2 != input_section->reserved2 ||
+        output_section->reserved3 != input_section->reserved3) {
+        return false;
+    }
+    if (output_section->zero_fill != input_zero_fill) {
+        return false;
+    }
+    return true;
+}
+
+static uint32_t cld_merge_section_flags(uint32_t output_flags, uint32_t input_flags) {
+    uint32_t section_type;
+    uint32_t merged_attributes;
+
+    section_type = output_flags & SECTION_TYPE;
+    merged_attributes = (output_flags | input_flags) & SECTION_ATTRIBUTES;
+    return section_type | merged_attributes;
 }
 
 static size_t cld_load_command_size_for_segments(const CldOutputSegment *segments, size_t segment_count) {
@@ -483,17 +579,22 @@ static void cld_normalize_tbd_symbol(const char *raw,
 
 static bool cld_tbd_symbol_matches(const char *requested,
                                    const char *normalized_candidate) {
+    const char *requested_base;
+    const char *candidate_base;
     size_t requested_length;
 
     if (requested == NULL || normalized_candidate == NULL) {
         return false;
     }
-    if (strcmp(requested, normalized_candidate) == 0) {
+    requested_base = requested[0] == '_' ? (requested + 1) : requested;
+    candidate_base = normalized_candidate[0] == '_' ? (normalized_candidate + 1) : normalized_candidate;
+
+    if (strcmp(requested_base, candidate_base) == 0) {
         return true;
     }
-    requested_length = strlen(requested);
-    return strncmp(normalized_candidate, requested, requested_length) == 0 &&
-           normalized_candidate[requested_length] == '$';
+    requested_length = strlen(requested_base);
+    return strncmp(candidate_base, requested_base, requested_length) == 0 &&
+           candidate_base[requested_length] == '$';
 }
 
 static bool cld_find_symbol_dylib_in_sdk_tbd_dir(const char *sdk_lib_dir,
@@ -910,6 +1011,8 @@ static bool cld_run_codesign(const char *output_path, CldError *error) {
     pid_t process_id;
     int spawn_status;
     int wait_status;
+    int waited_ms;
+    const int timeout_ms = 15000;
     char *const arguments[] = {
         "/usr/bin/codesign",
         "-s",
@@ -924,9 +1027,24 @@ static bool cld_run_codesign(const char *output_path, CldError *error) {
         return false;
     }
 
-    if (waitpid(process_id, &wait_status, 0) < 0) {
-        cld_set_error(error, "failed to wait for codesign on %s", output_path);
-        return false;
+    waited_ms = 0;
+    while (1) {
+        pid_t wr = waitpid(process_id, &wait_status, WNOHANG);
+        if (wr == process_id) {
+            break;
+        }
+        if (wr < 0) {
+            cld_set_error(error, "failed to wait for codesign on %s", output_path);
+            return false;
+        }
+        if (waited_ms >= timeout_ms) {
+            (void) kill(process_id, SIGKILL);
+            (void) waitpid(process_id, &wait_status, WNOHANG);
+            cld_set_error(error, "codesign timed out for %s", output_path);
+            return false;
+        }
+        usleep(100000);
+        waited_ms += 100;
     }
 
     if (!WIFEXITED(wait_status) || WEXITSTATUS(wait_status) != 0) {
@@ -936,6 +1054,24 @@ static bool cld_run_codesign(const char *output_path, CldError *error) {
 
     return true;
 #endif
+}
+
+static bool cld_trace_enabled(void) {
+    static int initialized = 0;
+    static bool enabled = false;
+    if (!initialized) {
+        const char *value = getenv("CLD_TRACE");
+        enabled = value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+        initialized = 1;
+    }
+    return enabled;
+}
+
+static void cld_trace_log(const char *message) {
+    if (cld_trace_enabled()) {
+        fprintf(stderr, "cld trace: %s\n", message);
+        fflush(stderr);
+    }
 }
 
 static bool cld_fixup_codesign_load_commands(const char *output_path, CldError *error) {
@@ -1094,6 +1230,36 @@ static bool cld_lookup_defined_symbol_by_name(const CldResolvedSymbol *symbols,
     return found;
 }
 
+static bool cld_lookup_defined_symbol_with_varargs_suffix(const CldResolvedSymbol *symbols,
+                                                          size_t symbol_count,
+                                                          const char *name,
+                                                          bool external_only,
+                                                          uint64_t *value,
+                                                          CldError *error) {
+    char candidate[512];
+    int written;
+
+    if (name == NULL || name[0] == '\0') {
+        return false;
+    }
+
+    if (strstr(name, "_varargs") != NULL) {
+        return false;
+    }
+
+    written = snprintf(candidate, sizeof(candidate), "%s_varargs", name);
+    if (written <= 0 || (size_t) written >= sizeof(candidate)) {
+        return false;
+    }
+
+    return cld_lookup_defined_symbol_by_name(symbols,
+                                             symbol_count,
+                                             candidate,
+                                             external_only,
+                                             value,
+                                             error);
+}
+
 static size_t cld_find_defined_symbol_index_by_name(const CldResolvedSymbol *symbols,
                                                     size_t symbol_count,
                                                     const char *name,
@@ -1222,29 +1388,54 @@ static bool cld_resolve_relocation_target(const CldInputObjectState *object_stat
         return false;
     }
 
-    *target_value = sections[object_state->section_map[relocation->r_symbolnum].output_section_index - 1].address;
+    *target_value = sections[object_state->section_map[relocation->r_symbolnum].output_section_index - 1].address
+        + object_state->section_map[relocation->r_symbolnum].offset_in_output;
     return true;
 }
 
 static bool cld_append_output_relocation(CldOutputSection *section,
                                          const struct relocation_info *relocation,
+                                         size_t owner_object_index,
                                          CldError *error) {
     struct relocation_info *next_relocations;
+    size_t *next_owner_objects;
     uint32_t next_capacity;
 
     if (section->relocation_count == section->relocation_capacity) {
+        uint32_t old_capacity;
+
+        old_capacity = section->relocation_capacity;
         next_capacity = section->relocation_capacity == 0 ? 8 : section->relocation_capacity * 2;
-        next_relocations = realloc(section->owned_relocations, (size_t) next_capacity * sizeof(*next_relocations));
+        next_relocations = calloc((size_t) next_capacity, sizeof(*next_relocations));
         if (next_relocations == NULL) {
             cld_set_error(error, "out of memory growing relocation table");
             return false;
         }
+        next_owner_objects = calloc((size_t) next_capacity, sizeof(*next_owner_objects));
+        if (next_owner_objects == NULL) {
+            cld_set_error(error, "out of memory growing relocation owner table");
+            free(next_relocations);
+            return false;
+        }
+
+        if (old_capacity != 0) {
+            memcpy(next_relocations,
+                   section->owned_relocations,
+                   (size_t) old_capacity * sizeof(*next_relocations));
+            memcpy(next_owner_objects,
+                   section->relocation_owner_objects,
+                   (size_t) old_capacity * sizeof(*next_owner_objects));
+        }
+        free(section->owned_relocations);
+        free(section->relocation_owner_objects);
         section->owned_relocations = next_relocations;
+        section->relocation_owner_objects = next_owner_objects;
         section->relocation_capacity = next_capacity;
         section->relocations = section->owned_relocations;
     }
 
     section->owned_relocations[section->relocation_count++] = *relocation;
+    section->relocation_owner_objects[section->relocation_count - 1] = owner_object_index;
     return true;
 }
 
@@ -1270,6 +1461,200 @@ static bool cld_patch_branch26(uint8_t *contents, uint64_t place, uint64_t targe
     instruction |= (uint32_t) (immediate & 0x03ffffffu);
     cld_write_u64(contents, 4, instruction);
     return true;
+}
+
+static bool cld_patch_x86_64_rel32(uint8_t *contents,
+                                   uint64_t place,
+                                   uint64_t target,
+                                   uint32_t displacement_adjust,
+                                   CldError *error) {
+    int64_t delta;
+
+    delta = (int64_t) target - (int64_t) (place + 4u + displacement_adjust);
+    if (delta < INT32_MIN || delta > INT32_MAX) {
+        cld_set_error(error, "x86_64 rel32 target is out of range");
+        return false;
+    }
+
+    cld_write_u64(contents, 4, (uint32_t) (int32_t) delta);
+    return true;
+}
+
+static bool cld_resolve_x86_64_symbol_via_rosetta(const char *symbol_name,
+                                                  const char *dylib_path,
+                                                  uint64_t *address,
+                                                  CldError *error) {
+#if defined(_WIN32)
+    (void) symbol_name;
+    (void) dylib_path;
+    (void) address;
+    cld_set_error(error, "cross-arch x86_64 symbol resolution is not supported on Windows");
+    return false;
+#else
+    const char *experimental_resolver;
+    const char *lookup_name;
+    static const char *python_script =
+        "import ctypes,sys;"
+        "libdl=ctypes.CDLL('/usr/lib/libSystem.B.dylib');"
+        "libdl.dlopen.argtypes=[ctypes.c_char_p,ctypes.c_int];"
+        "libdl.dlopen.restype=ctypes.c_void_p;"
+        "libdl.dlsym.argtypes=[ctypes.c_void_p,ctypes.c_char_p];"
+        "libdl.dlsym.restype=ctypes.c_void_p;"
+        "sym=sys.argv[1].encode();"
+        "path=(sys.argv[2] if len(sys.argv)>2 else '');"
+        "h=libdl.dlopen(path.encode(),2) if path else libdl.dlopen(None,2);"
+        "alt=(sym[1:] if sym.startswith(b'_') else b'_'+sym);"
+        "a=libdl.dlsym(h,sym) if h else 0;"
+        "a=a or (libdl.dlsym(h,alt) if h else 0);"
+        "print(hex(a) if a else '')";
+    int pipe_fds[2];
+    posix_spawn_file_actions_t file_actions;
+    pid_t pid;
+    const char *argv_with_dylib[8];
+    const char *argv_default[7];
+    const char **argv;
+    int wait_status;
+    int wait_tries;
+    int rc;
+    int flags;
+    fd_set read_fds;
+    struct timeval timeout;
+    ssize_t bytes_read;
+    size_t output_len;
+    char output[128];
+    char *end;
+    unsigned long long parsed;
+
+    experimental_resolver = getenv("CLD_ENABLE_EXPERIMENTAL_ROSETTA_RESOLVER");
+    if (experimental_resolver == NULL || strcmp(experimental_resolver, "1") != 0) {
+        cld_set_error(error,
+                      "cross-arch x86_64 host-symbol resolution is disabled by default (set CLD_ENABLE_EXPERIMENTAL_ROSETTA_RESOLVER=1 to enable experimental resolver)");
+        return false;
+    }
+
+    if (symbol_name == NULL || symbol_name[0] == '\0' || address == NULL) {
+        cld_set_error(error, "invalid symbol lookup request for Rosetta resolver");
+        return false;
+    }
+
+    lookup_name = symbol_name;
+
+    if (pipe(pipe_fds) != 0) {
+        cld_set_error(error, "failed to create pipe for Rosetta resolver (%s)", strerror(errno));
+        return false;
+    }
+
+    if (posix_spawn_file_actions_init(&file_actions) != 0) {
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        cld_set_error(error, "failed to initialize Rosetta resolver file actions");
+        return false;
+    }
+
+    (void) posix_spawn_file_actions_adddup2(&file_actions, pipe_fds[1], STDOUT_FILENO);
+    (void) posix_spawn_file_actions_addopen(&file_actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+    (void) posix_spawn_file_actions_addclose(&file_actions, pipe_fds[0]);
+    (void) posix_spawn_file_actions_addclose(&file_actions, pipe_fds[1]);
+
+    if (dylib_path != NULL && dylib_path[0] != '\0') {
+        argv_with_dylib[0] = "arch";
+        argv_with_dylib[1] = "-x86_64";
+        argv_with_dylib[2] = "/usr/bin/python3";
+        argv_with_dylib[3] = "-c";
+        argv_with_dylib[4] = python_script;
+        argv_with_dylib[5] = lookup_name;
+        argv_with_dylib[6] = dylib_path;
+        argv_with_dylib[7] = NULL;
+        argv = argv_with_dylib;
+    } else {
+        argv_default[0] = "arch";
+        argv_default[1] = "-x86_64";
+        argv_default[2] = "/usr/bin/python3";
+        argv_default[3] = "-c";
+        argv_default[4] = python_script;
+        argv_default[5] = lookup_name;
+        argv_default[6] = NULL;
+        argv = argv_default;
+    }
+
+    rc = posix_spawnp(&pid, "arch", &file_actions, NULL, (char *const *) argv, environ);
+    posix_spawn_file_actions_destroy(&file_actions);
+    close(pipe_fds[1]);
+    if (rc != 0) {
+        close(pipe_fds[0]);
+        cld_set_error(error, "failed to launch Rosetta resolver for symbol %s", symbol_name);
+        return false;
+    }
+
+    flags = fcntl(pipe_fds[0], F_GETFL, 0);
+    if (flags >= 0) {
+        (void) fcntl(pipe_fds[0], F_SETFL, flags | O_NONBLOCK);
+    }
+
+    output[0] = '\0';
+    output_len = 0;
+    timeout.tv_sec = 3;
+    timeout.tv_usec = 0;
+
+    FD_ZERO(&read_fds);
+    FD_SET(pipe_fds[0], &read_fds);
+    rc = select(pipe_fds[0] + 1, &read_fds, NULL, NULL, &timeout);
+    if (rc <= 0) {
+        (void) kill(pid, SIGKILL);
+        (void) waitpid(pid, NULL, WNOHANG);
+        close(pipe_fds[0]);
+        cld_set_error(error, "Rosetta resolver timed out for symbol %s", symbol_name);
+        return false;
+    }
+
+    bytes_read = read(pipe_fds[0], output, sizeof(output) - 1);
+    close(pipe_fds[0]);
+    output[(bytes_read > 0) ? (size_t) bytes_read : 0u] = '\0';
+
+    wait_status = 0;
+    wait_tries = 0;
+    while (wait_tries < 20) {
+        pid_t wr = waitpid(pid, &wait_status, WNOHANG);
+        if (wr == pid) {
+            break;
+        }
+        if (wr == -1) {
+            cld_set_error(error, "Rosetta resolver wait failed for symbol %s", symbol_name);
+            return false;
+        }
+        usleep(10000);
+        wait_tries += 1;
+    }
+    if (wait_tries >= 20) {
+        (void) kill(pid, SIGKILL);
+        (void) waitpid(pid, NULL, WNOHANG);
+        cld_set_error(error, "Rosetta resolver process did not exit for symbol %s", symbol_name);
+        return false;
+    }
+    if (!WIFEXITED(wait_status) || WEXITSTATUS(wait_status) != 0) {
+        cld_set_error(error, "Rosetta resolver failed for symbol %s", symbol_name);
+        return false;
+    }
+
+    if (bytes_read <= 0) {
+        cld_set_error(error, "Rosetta resolver returned no address for symbol %s", symbol_name);
+        return false;
+    }
+
+    while (output[output_len] != '\0' && output[output_len] != '\n' && output[output_len] != '\r') {
+        output_len += 1;
+    }
+    output[output_len] = '\0';
+
+    parsed = strtoull(output, &end, 0);
+    if (end == output || parsed == 0ull) {
+        cld_set_error(error, "Rosetta resolver produced invalid address for symbol %s", symbol_name);
+        return false;
+    }
+
+    *address = (uint64_t) parsed;
+    return true;
+#endif
 }
 
 static bool cld_patch_page21(uint8_t *contents, uint64_t place, uint64_t target, uint64_t page_size, CldError *error) {
@@ -1353,6 +1738,7 @@ static bool cld_apply_relocations(const CldTarget *target,
                                   CldOutputSection *sections,
                                   size_t section_count,
                                   const CldInputObjectState *object_states,
+                                  size_t object_state_count,
                                   const CldResolvedSymbol *symbols,
                                   CldOutputSection *startup_section,
                                   uint32_t *import_stub_slots,
@@ -1360,8 +1746,15 @@ static bool cld_apply_relocations(const CldTarget *target,
                                   uint32_t *next_import_stub_slot,
                                   CldError *error) {
     size_t section_index;
+    uint64_t startup_prologue_size;
+    uint64_t import_stub_size;
 
-    (void) target;
+    startup_prologue_size = target->cpu_type == CPU_TYPE_X86_64
+                                ? CLD_X86_64_STARTUP_PROLOGUE_SIZE
+                                : CLD_ARM64_STARTUP_PROLOGUE_SIZE;
+    import_stub_size = target->cpu_type == CPU_TYPE_X86_64
+                           ? CLD_X86_64_IMPORT_STUB_SIZE
+                           : CLD_ARM64_IMPORT_STUB_SIZE;
 
     for (section_index = 0; section_index < section_count; ++section_index) {
         CldOutputSection *section;
@@ -1369,7 +1762,7 @@ static bool cld_apply_relocations(const CldTarget *target,
         int64_t pending_addend;
 
         section = &sections[section_index];
-        if (section->relocation_count == 0 || section->input_object_index == SIZE_MAX) {
+        if (section->relocation_count == 0) {
             continue;
         }
 
@@ -1377,6 +1770,7 @@ static bool cld_apply_relocations(const CldTarget *target,
         for (relocation_index = 0; relocation_index < section->relocation_count; ++relocation_index) {
             const struct relocation_info *relocation;
             const CldInputObjectState *object_state;
+            size_t owner_object_index;
             uint8_t *fixup;
             uint64_t place;
             uint64_t target_value;
@@ -1384,7 +1778,15 @@ static bool cld_apply_relocations(const CldTarget *target,
             uint64_t encoded_addend;
 
             relocation = &section->relocations[relocation_index];
-            object_state = &object_states[section->input_object_index];
+            owner_object_index = section->input_object_index;
+            if (section->relocation_owner_objects != NULL) {
+                owner_object_index = section->relocation_owner_objects[relocation_index];
+            }
+            if (owner_object_index == SIZE_MAX || owner_object_index >= object_state_count) {
+                cld_set_error(error, "relocation owner object index is invalid");
+                return false;
+            }
+            object_state = &object_states[owner_object_index];
             if (relocation->r_address < 0 || (uint64_t) relocation->r_address >= section->size) {
                 cld_set_error(error, "relocation address %d is outside section %s,%s", relocation->r_address, section->segname, section->sectname);
                 return false;
@@ -1421,11 +1823,30 @@ static bool cld_apply_relocations(const CldTarget *target,
                     const char *host_symbol_name;
                     void *host_symbol_ptr;
 
-                    if (relocation->r_type != ARM64_RELOC_BRANCH26) {
+                    if (target->cpu_type == CPU_TYPE_ARM64) {
+                        if (relocation->r_type != ARM64_RELOC_BRANCH26) {
+                            cld_set_error(error,
+                                          "dynamic import relocation type %u for %s is not supported yet",
+                                          relocation->r_type,
+                                          symbols[resolved_symbol_index].name);
+                            return false;
+                        }
+                    } else if (target->cpu_type == CPU_TYPE_X86_64) {
+                        if (relocation->r_type != X86_64_RELOC_BRANCH &&
+                            relocation->r_type != X86_64_RELOC_SIGNED &&
+                            relocation->r_type != X86_64_RELOC_SIGNED_1 &&
+                            relocation->r_type != X86_64_RELOC_SIGNED_2 &&
+                            relocation->r_type != X86_64_RELOC_SIGNED_4) {
+                            cld_set_error(error,
+                                          "x86_64 dynamic import relocation type %u for %s is not supported yet",
+                                          relocation->r_type,
+                                          symbols[resolved_symbol_index].name);
+                            return false;
+                        }
+                    } else {
                         cld_set_error(error,
-                                      "dynamic import relocation type %u for %s is not supported yet",
-                                      relocation->r_type,
-                                      symbols[resolved_symbol_index].name);
+                                      "dynamic imports are unsupported for target %s",
+                                      target->name);
                         return false;
                     }
 
@@ -1455,81 +1876,121 @@ static bool cld_apply_relocations(const CldTarget *target,
                                       symbols[resolved_symbol_index].name);
                         return false;
 #else
-                        if (symbols[resolved_symbol_index].dynamic_import_dylib != NULL &&
-                            symbols[resolved_symbol_index].dynamic_import_dylib[0] != '\0') {
-                            void *import_handle;
-                            import_handle = dlopen(symbols[resolved_symbol_index].dynamic_import_dylib,
-                                                   RTLD_LAZY);
-                            if (import_handle == NULL) {
+                        if (target->cpu_type == CLD_HOST_CPU_TYPE) {
+                            if (symbols[resolved_symbol_index].dynamic_import_dylib != NULL &&
+                                symbols[resolved_symbol_index].dynamic_import_dylib[0] != '\0') {
+                                void *import_handle;
+                                import_handle = dlopen(symbols[resolved_symbol_index].dynamic_import_dylib,
+                                                       RTLD_LAZY);
+                                if (import_handle == NULL) {
+                                    cld_set_error(error,
+                                                  "unable to open import dylib %s for symbol %s",
+                                                  symbols[resolved_symbol_index].dynamic_import_dylib,
+                                                  symbols[resolved_symbol_index].name);
+                                    return false;
+                                }
+                                host_symbol_ptr = dlsym(import_handle, host_symbol_name);
+                                if (host_symbol_ptr == NULL) {
+                                    host_symbol_ptr = dlsym(import_handle, symbols[resolved_symbol_index].name);
+                                }
+                            }
+                            if (host_symbol_ptr == NULL) {
+                                host_symbol_ptr = dlsym(RTLD_DEFAULT, host_symbol_name);
+                            }
+                            if (host_symbol_ptr == NULL) {
+                                host_symbol_ptr = dlsym(RTLD_DEFAULT, symbols[resolved_symbol_index].name);
+                            }
+                            if (host_symbol_ptr == NULL) {
                                 cld_set_error(error,
-                                              "unable to open import dylib %s for symbol %s",
-                                              symbols[resolved_symbol_index].dynamic_import_dylib,
+                                              "unable to resolve host symbol for dynamic import %s",
                                               symbols[resolved_symbol_index].name);
                                 return false;
                             }
-                            host_symbol_ptr = dlsym(import_handle, host_symbol_name);
-                            if (host_symbol_ptr == NULL) {
-                                host_symbol_ptr = dlsym(import_handle, symbols[resolved_symbol_index].name);
+                            host_symbol_address = (uint64_t) (uintptr_t) host_symbol_ptr;
+                        } else if (target->cpu_type == CPU_TYPE_X86_64 && CLD_HOST_CPU_TYPE == CPU_TYPE_ARM64) {
+                            if (!cld_resolve_x86_64_symbol_via_rosetta(symbols[resolved_symbol_index].name,
+                                                                        symbols[resolved_symbol_index].dynamic_import_dylib,
+                                                                        &host_symbol_address,
+                                                                        error)) {
+                                return false;
                             }
-                        }
-                        if (host_symbol_ptr == NULL) {
-                            host_symbol_ptr = dlsym(RTLD_DEFAULT, host_symbol_name);
-                        }
-                        if (host_symbol_ptr == NULL) {
-                            host_symbol_ptr = dlsym(RTLD_DEFAULT, symbols[resolved_symbol_index].name);
-                        }
-                        if (host_symbol_ptr == NULL) {
+                        } else {
                             cld_set_error(error,
-                                          "unable to resolve host symbol for dynamic import %s",
-                                          symbols[resolved_symbol_index].name);
+                                          "dynamic imports are unsupported for cross-arch target %s on this host",
+                                          target->name);
                             return false;
                         }
 #endif
 
-                        host_symbol_address = (uint64_t) (uintptr_t) host_symbol_ptr;
                         stub_slot = *next_import_stub_slot;
                         *next_import_stub_slot += 1;
                         import_stub_slots[resolved_symbol_index] = stub_slot;
 
-                        if ((uint64_t) CLD_STARTUP_PROLOGUE_SIZE
-                            + ((uint64_t) stub_slot + 1u) * CLD_IMPORT_STUB_SIZE
+                        if (startup_prologue_size
+                            + ((uint64_t) stub_slot + 1u) * import_stub_size
                             > startup_section->size) {
                             cld_set_error(error, "startup section import-stub area is too small");
                             return false;
                         }
 
-                        cld_write_u64(startup_section->contents
-                                      + CLD_STARTUP_PROLOGUE_SIZE
-                                      + (size_t) stub_slot * CLD_IMPORT_STUB_SIZE,
-                                      4,
-                                      CLD_ARM64_LDR_LITERAL_X16_PLUS8);
-                        cld_write_u64(startup_section->contents
-                                      + CLD_STARTUP_PROLOGUE_SIZE
-                                      + (size_t) stub_slot * CLD_IMPORT_STUB_SIZE
-                                      + 4,
-                                      4,
-                                      CLD_ARM64_BR_X16);
-                        cld_write_u64(startup_section->contents
-                                      + CLD_STARTUP_PROLOGUE_SIZE
-                                      + (size_t) stub_slot * CLD_IMPORT_STUB_SIZE
-                                      + 8,
-                                      8,
-                                      host_symbol_address);
+                        if (target->cpu_type == CPU_TYPE_ARM64) {
+                            cld_write_u64(startup_section->contents
+                                          + startup_prologue_size
+                                          + (size_t) stub_slot * import_stub_size,
+                                          4,
+                                          CLD_ARM64_LDR_LITERAL_X16_PLUS8);
+                            cld_write_u64(startup_section->contents
+                                          + startup_prologue_size
+                                          + (size_t) stub_slot * import_stub_size
+                                          + 4,
+                                          4,
+                                          CLD_ARM64_BR_X16);
+                            cld_write_u64(startup_section->contents
+                                          + startup_prologue_size
+                                          + (size_t) stub_slot * import_stub_size
+                                          + 8,
+                                          8,
+                                          host_symbol_address);
+                        } else {
+                            uint8_t *stub = startup_section->contents
+                                            + startup_prologue_size
+                                            + (size_t) stub_slot * import_stub_size;
+                            memset(stub, 0x90, (size_t) import_stub_size);
+                            stub[0] = 0x49;
+                            stub[1] = 0xbb;
+                            cld_write_u64(stub + 2, 8, host_symbol_address);
+                            stub[10] = 0x41;
+                            stub[11] = 0xff;
+                            stub[12] = 0xe3;
+                        }
                     }
 
                     stub_address = startup_section->address
-                                 + CLD_STARTUP_PROLOGUE_SIZE
-                                 + (uint64_t) stub_slot * CLD_IMPORT_STUB_SIZE;
+                                 + startup_prologue_size
+                                 + (uint64_t) stub_slot * import_stub_size;
 
-                    if (!cld_patch_branch26(fixup, place, stub_address, error)) {
-                        return false;
+                    if (target->cpu_type == CPU_TYPE_ARM64) {
+                        if (!cld_patch_branch26(fixup, place, stub_address, error)) {
+                            return false;
+                        }
+                    } else {
+                        uint32_t adjust = 0;
+                        if (relocation->r_type == X86_64_RELOC_SIGNED_1)
+                            adjust = 1;
+                        else if (relocation->r_type == X86_64_RELOC_SIGNED_2)
+                            adjust = 2;
+                        else if (relocation->r_type == X86_64_RELOC_SIGNED_4)
+                            adjust = 4;
+                        if (!cld_patch_x86_64_rel32(fixup, place, stub_address, adjust, error)) {
+                            return false;
+                        }
                     }
                     pending_addend = 0;
                     continue;
                 }
             }
 
-            if (relocation->r_type == ARM64_RELOC_SUBTRACTOR) {
+            if (target->cpu_type == CPU_TYPE_ARM64 && relocation->r_type == ARM64_RELOC_SUBTRACTOR) {
                 const struct relocation_info *next_relocation;
                 uint64_t subtrahend;
                 uint64_t minuend;
@@ -1564,39 +2025,70 @@ static bool cld_apply_relocations(const CldTarget *target,
             target_value += (uint64_t) pending_addend;
             pending_addend = 0;
 
-            switch (relocation->r_type) {
-                case ARM64_RELOC_UNSIGNED:
-                    encoded_addend = cld_read_u64(fixup, width);
-                    cld_write_u64(fixup, width, target_value + encoded_addend);
-                    break;
-                case ARM64_RELOC_BRANCH26:
-                    if (!cld_patch_branch26(fixup, place, target_value, error)) {
+            if (target->cpu_type == CPU_TYPE_ARM64) {
+                switch (relocation->r_type) {
+                    case ARM64_RELOC_UNSIGNED:
+                        encoded_addend = cld_read_u64(fixup, width);
+                        cld_write_u64(fixup, width, target_value + encoded_addend);
+                        break;
+                    case ARM64_RELOC_BRANCH26:
+                        if (!cld_patch_branch26(fixup, place, target_value, error)) {
+                            return false;
+                        }
+                        break;
+                    case ARM64_RELOC_PAGE21:
+                        if (!cld_patch_page21(fixup, place, target_value, CLD_ARM64_RELOCATION_PAGE_SIZE, error)) {
+                            return false;
+                        }
+                        break;
+                    case ARM64_RELOC_PAGEOFF12:
+                        if (!cld_patch_pageoff12(fixup, target_value, relocation->r_length, CLD_ARM64_RELOCATION_PAGE_SIZE, error)) {
+                            return false;
+                        }
+                        break;
+                    case ARM64_RELOC_GOT_LOAD_PAGE21:
+                        if (!cld_patch_page21(fixup, place, target_value, CLD_ARM64_RELOCATION_PAGE_SIZE, error)) {
+                            return false;
+                        }
+                        break;
+                    case ARM64_RELOC_GOT_LOAD_PAGEOFF12:
+                        if (!cld_relax_got_load_pageoff12(fixup, target_value, CLD_ARM64_RELOCATION_PAGE_SIZE, error)) {
+                            return false;
+                        }
+                        break;
+                    default:
+                        cld_set_error(error, "unsupported arm64 relocation type %u in %s,%s", relocation->r_type, section->segname, section->sectname);
                         return false;
+                }
+            } else if (target->cpu_type == CPU_TYPE_X86_64) {
+                switch (relocation->r_type) {
+                    case X86_64_RELOC_UNSIGNED:
+                        encoded_addend = cld_read_u64(fixup, width);
+                        cld_write_u64(fixup, width, target_value + encoded_addend);
+                        break;
+                    case X86_64_RELOC_BRANCH:
+                    case X86_64_RELOC_SIGNED:
+                    case X86_64_RELOC_SIGNED_1:
+                    case X86_64_RELOC_SIGNED_2:
+                    case X86_64_RELOC_SIGNED_4: {
+                        uint32_t adjust = 0;
+                        if (relocation->r_type == X86_64_RELOC_SIGNED_1)
+                            adjust = 1;
+                        else if (relocation->r_type == X86_64_RELOC_SIGNED_2)
+                            adjust = 2;
+                        else if (relocation->r_type == X86_64_RELOC_SIGNED_4)
+                            adjust = 4;
+                        if (!cld_patch_x86_64_rel32(fixup, place, target_value, adjust, error))
+                            return false;
+                        break;
                     }
-                    break;
-                case ARM64_RELOC_PAGE21:
-                    if (!cld_patch_page21(fixup, place, target_value, CLD_ARM64_RELOCATION_PAGE_SIZE, error)) {
+                    default:
+                        cld_set_error(error, "unsupported x86_64 relocation type %u in %s,%s", relocation->r_type, section->segname, section->sectname);
                         return false;
-                    }
-                    break;
-                case ARM64_RELOC_PAGEOFF12:
-                    if (!cld_patch_pageoff12(fixup, target_value, relocation->r_length, CLD_ARM64_RELOCATION_PAGE_SIZE, error)) {
-                        return false;
-                    }
-                    break;
-                case ARM64_RELOC_GOT_LOAD_PAGE21:
-                    if (!cld_patch_page21(fixup, place, target_value, CLD_ARM64_RELOCATION_PAGE_SIZE, error)) {
-                        return false;
-                    }
-                    break;
-                case ARM64_RELOC_GOT_LOAD_PAGEOFF12:
-                    if (!cld_relax_got_load_pageoff12(fixup, target_value, CLD_ARM64_RELOCATION_PAGE_SIZE, error)) {
-                        return false;
-                    }
-                    break;
-                default:
-                    cld_set_error(error, "unsupported arm64 relocation type %u in %s,%s", relocation->r_type, section->segname, section->sectname);
-                    return false;
+                }
+            } else {
+                cld_set_error(error, "unsupported relocation CPU type %d", (int) target->cpu_type);
+                return false;
             }
         }
     }
@@ -1702,6 +2194,13 @@ static bool cld_emit_macho_relocatable(const CldMachOObject *object_files,
     for (object_index = 0; object_index < object_count; ++object_index) {
         object_states[object_index].input = &object_files[object_index];
         object_states[object_index].object_index = object_index;
+        if (object_files[object_index].cputype != options->target->cpu_type) {
+            cld_set_error(error,
+                          "input object %s CPU type does not match target %s",
+                          object_files[object_index].path,
+                          options->target->name);
+            goto cleanup;
+        }
         object_states[object_index].symbol_start = total_symbol_count;
         total_symbol_count += object_files[object_index].symbol_count;
         max_section_count += object_files[object_index].section_count;
@@ -1715,6 +2214,7 @@ static bool cld_emit_macho_relocatable(const CldMachOObject *object_files,
             goto cleanup;
         }
     }
+    cld_trace_log("object state maps prepared");
 
     sections = calloc(max_section_count, sizeof(*sections));
     symbols = calloc(total_symbol_count, sizeof(*symbols));
@@ -1754,11 +2254,7 @@ static bool cld_emit_macho_relocatable(const CldMachOObject *object_files,
                 ++output_section_count;
             } else {
                 output_section = &sections[existing_index];
-                if (output_section->flags != input_section->flags ||
-                    output_section->reserved1 != input_section->reserved1 ||
-                    output_section->reserved2 != input_section->reserved2 ||
-                    output_section->reserved3 != input_section->reserved3 ||
-                    output_section->zero_fill != (((input_section->flags & SECTION_TYPE) == S_ZEROFILL))) {
+                if (!cld_sections_are_merge_compatible(output_section, input_section)) {
                     cld_set_error(error,
                                   "cannot merge incompatible section %s,%s from %s",
                                   input_section->segname,
@@ -1766,6 +2262,7 @@ static bool cld_emit_macho_relocatable(const CldMachOObject *object_files,
                                   object_file->path);
                     goto cleanup;
                 }
+                output_section->flags = cld_merge_section_flags(output_section->flags, input_section->flags);
                 output_section->align = (uint32_t) cld_max_u64(output_section->align, input_section->align);
             }
 
@@ -2072,7 +2569,7 @@ static bool cld_emit_macho_relocatable(const CldMachOObject *object_files,
                     output_relocation.r_symbolnum = object_states[object_index].section_map[output_relocation.r_symbolnum].output_section_index;
                 }
 
-                if (!cld_append_output_relocation(output_section, &output_relocation, error)) {
+                if (!cld_append_output_relocation(output_section, &output_relocation, SIZE_MAX, error)) {
                     goto cleanup;
                 }
             }
@@ -2210,6 +2707,7 @@ cleanup:
     if (sections != NULL) {
         for (section_index = 0; section_index < output_section_count; ++section_index) {
             free(sections[section_index].owned_relocations);
+            free(sections[section_index].relocation_owner_objects);
             free(sections[section_index].contents);
         }
     }
@@ -2266,6 +2764,8 @@ static bool cld_link_macho_arm64_executable(const CldMachOObject *object_files,
     size_t startup_section_index;
     uint32_t local_symbol_count;
     uint32_t external_symbol_count;
+    uint32_t undefined_symbol_count;
+    uint32_t emitted_symbol_count;
     uint32_t *import_stub_slots;
     uint32_t next_import_stub_slot;
     bool has_build_version;
@@ -2274,6 +2774,8 @@ static bool cld_link_macho_arm64_executable(const CldMachOObject *object_files,
     CldSymbolNameSet needed_dylibs;
     bool tbd_cache_hit;
     bool tbd_cache_dirty;
+    uint64_t startup_prologue_size;
+    uint64_t import_stub_size;
     bool success;
 
     target = options->target != NULL ? options->target : &cld_target_macos_arm64;
@@ -2294,9 +2796,16 @@ static bool cld_link_macho_arm64_executable(const CldMachOObject *object_files,
     memset(&needed_dylibs, 0, sizeof(needed_dylibs));
     tbd_cache_hit = false;
     tbd_cache_dirty = false;
+    startup_prologue_size = target->cpu_type == CPU_TYPE_X86_64
+                                ? CLD_X86_64_STARTUP_PROLOGUE_SIZE
+                                : CLD_ARM64_STARTUP_PROLOGUE_SIZE;
+    import_stub_size = target->cpu_type == CPU_TYPE_X86_64
+                           ? CLD_X86_64_IMPORT_STUB_SIZE
+                           : CLD_ARM64_IMPORT_STUB_SIZE;
+    cld_trace_log("link start");
     success = false;
     total_symbol_count = 0;
-    output_section_count = 1;
+    output_section_count = 0;
 
     if (object_states == NULL) {
         cld_set_error(error, "out of memory allocating linker object state");
@@ -2315,10 +2824,28 @@ static bool cld_link_macho_arm64_executable(const CldMachOObject *object_files,
             goto cleanup;
         }
     }
+    cld_trace_log("sdk cache loaded");
 
     for (object_index = 0; object_index < object_count; ++object_index) {
         object_states[object_index].input = &object_files[object_index];
         object_states[object_index].object_index = object_index;
+        if (cld_trace_enabled()) {
+            fprintf(stderr,
+                    "cld trace: object[%zu] path=%s cputype=%d sections=%zu symbols=%zu\n",
+                    object_index,
+                    object_files[object_index].path,
+                    object_files[object_index].cputype,
+                    object_files[object_index].section_count,
+                    object_files[object_index].symbol_count);
+            fflush(stderr);
+        }
+        if (object_files[object_index].cputype != target->cpu_type) {
+            cld_set_error(error,
+                          "input object %s CPU type does not match target %s",
+                          object_files[object_index].path,
+                          target->name);
+            goto cleanup;
+        }
         object_states[object_index].symbol_start = total_symbol_count;
         total_symbol_count += object_files[object_index].symbol_count;
         for (section_index = 0; section_index < object_files[object_index].section_count; ++section_index) {
@@ -2331,6 +2858,10 @@ static bool cld_link_macho_arm64_executable(const CldMachOObject *object_files,
         if (object_states[object_index].section_map == NULL) {
             cld_set_error(error, "out of memory allocating section map");
             goto cleanup;
+        }
+        if (cld_trace_enabled()) {
+            fprintf(stderr, "cld trace: object[%zu] section map allocated\n", object_index);
+            fflush(stderr);
         }
     }
 
@@ -2350,27 +2881,7 @@ static bool cld_link_macho_arm64_executable(const CldMachOObject *object_files,
     for (symbol_index = 0; symbol_index < total_symbol_count; ++symbol_index) {
         import_stub_slots[symbol_index] = UINT32_MAX;
     }
-
-    startup_section_index = 0;
-    memset(&sections[startup_section_index], 0, sizeof(sections[startup_section_index]));
-    if (!cld_copy_name(sections[startup_section_index].segname, SEG_TEXT) || !cld_copy_name(sections[startup_section_index].sectname, "__cld_start")) {
-        cld_set_error(error, "failed to initialize startup section name");
-        goto cleanup;
-    }
-    sections[startup_section_index].input_object_index = SIZE_MAX;
-    sections[startup_section_index].flags = S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS;
-    sections[startup_section_index].align = 2;
-    sections[startup_section_index].size = CLD_STARTUP_PROLOGUE_SIZE + ((uint64_t) CLD_IMPORT_STUB_CAPACITY * CLD_IMPORT_STUB_SIZE);
-    sections[startup_section_index].contents = calloc(1, (size_t) sections[startup_section_index].size);
-    if (sections[startup_section_index].contents == NULL) {
-        cld_set_error(error, "out of memory allocating startup section");
-        goto cleanup;
-    }
-    cld_write_u64(sections[startup_section_index].contents + 0, 4, 0x94000000u);
-    cld_write_u64(sections[startup_section_index].contents + 4, 4, 0xd2800030u);
-    cld_write_u64(sections[startup_section_index].contents + 8, 4, 0xf2a40010u);
-    cld_write_u64(sections[startup_section_index].contents + 12, 4, 0xd4001001u);
-    cld_write_u64(sections[startup_section_index].contents + 16, 4, CLD_ARM64_B_IMM26_ZERO);
+    cld_trace_log("link state allocations complete");
 
     ordered_segment_count = 0;
     if (!cld_copy_name(ordered_segment_names[ordered_segment_count++], SEG_TEXT)) {
@@ -2399,7 +2910,7 @@ static bool cld_link_macho_arm64_executable(const CldMachOObject *object_files,
         }
     }
 
-    output_section_count = 1;
+    output_section_count = 0;
     for (ordered_segment_index = 0; ordered_segment_index < ordered_segment_count; ++ordered_segment_index) {
         for (object_index = 0; object_index < object_count; ++object_index) {
             const CldMachOObject *object_file;
@@ -2408,6 +2919,11 @@ static bool cld_link_macho_arm64_executable(const CldMachOObject *object_files,
             for (section_index = 0; section_index < object_file->section_count; ++section_index) {
                 CldOutputSection *section;
                 const CldInputSection *input_section;
+                ssize_t existing_index;
+                uint64_t offset_in_output;
+                uint64_t alignment;
+                uint64_t new_size;
+                uint32_t relocation_index;
 
                 input_section = &object_file->sections[section_index];
                 if (!cld_is_section_kept(input_section)) {
@@ -2417,33 +2933,215 @@ static bool cld_link_macho_arm64_executable(const CldMachOObject *object_files,
                     continue;
                 }
 
-                section = &sections[output_section_count++];
-                memset(section, 0, sizeof(*section));
-                memcpy(section->segname, input_section->segname, CLD_NAME_CAPACITY);
-                memcpy(section->sectname, input_section->sectname, CLD_NAME_CAPACITY);
-                section->flags = input_section->flags;
-                section->align = input_section->align;
-                section->reserved1 = input_section->reserved1;
-                section->reserved2 = input_section->reserved2;
-                section->reserved3 = input_section->reserved3;
-                section->input_object_index = object_index;
-                section->input_section_index = input_section->input_index;
-                section->size = input_section->size;
-                section->zero_fill = ((input_section->flags & SECTION_TYPE) == S_ZEROFILL);
-                section->relocations = input_section->relocations;
-                section->relocation_count = input_section->relocation_count;
-                if (!section->zero_fill && section->size != 0) {
-                    section->contents = malloc((size_t) section->size);
-                    if (section->contents == NULL) {
+                existing_index = cld_find_output_section(sections,
+                                                         output_section_count,
+                                                         input_section->segname,
+                                                         input_section->sectname);
+                if (existing_index < 0) {
+                    section = &sections[output_section_count++];
+                    memset(section, 0, sizeof(*section));
+                    memcpy(section->segname, input_section->segname, CLD_NAME_CAPACITY);
+                    memcpy(section->sectname, input_section->sectname, CLD_NAME_CAPACITY);
+                    section->flags = input_section->flags;
+                    section->align = input_section->align;
+                    section->reserved1 = input_section->reserved1;
+                    section->reserved2 = input_section->reserved2;
+                    section->reserved3 = input_section->reserved3;
+                    section->input_object_index = SIZE_MAX;
+                    section->input_section_index = 0;
+                    section->zero_fill = ((input_section->flags & SECTION_TYPE) == S_ZEROFILL);
+                } else {
+                    section = &sections[existing_index];
+                    if (!cld_sections_are_merge_compatible(section, input_section)) {
+                        cld_set_error(error,
+                                      "cannot merge incompatible section %s,%s from %s",
+                                      input_section->segname,
+                                      input_section->sectname,
+                                      object_file->path);
+                        goto cleanup;
+                    }
+                    section->flags = cld_merge_section_flags(section->flags, input_section->flags);
+                    section->align = (uint32_t) cld_max_u64(section->align, input_section->align);
+                }
+
+                alignment = 1ull << cld_min_u64(input_section->align, 15);
+                offset_in_output = cld_align_up_u64(section->size, alignment);
+                new_size = offset_in_output + input_section->size;
+
+                object_states[object_index].section_map[input_section->input_index].output_section_index =
+                    (uint32_t) (section - sections + 1);
+                object_states[object_index].section_map[input_section->input_index].offset_in_output =
+                    offset_in_output;
+
+                if (!section->zero_fill && new_size != 0) {
+                    uint8_t *next_contents;
+
+                    next_contents = realloc(section->contents, (size_t) new_size);
+                    if (next_contents == NULL) {
                         cld_set_error(error, "out of memory copying section contents");
                         goto cleanup;
                     }
-                    memcpy(section->contents, input_section->contents, (size_t) section->size);
+                    if (new_size > section->size) {
+                        memset(next_contents + section->size, 0, (size_t) (new_size - section->size));
+                    }
+                    section->contents = next_contents;
+                    if (input_section->size != 0) {
+                        memcpy(section->contents + offset_in_output,
+                               input_section->contents,
+                               (size_t) input_section->size);
+                    }
                 }
-                object_states[object_index].section_map[input_section->input_index].output_section_index = (uint32_t) output_section_count;
-                object_states[object_index].section_map[input_section->input_index].offset_in_output = 0;
+
+                for (relocation_index = 0; relocation_index < input_section->relocation_count; ++relocation_index) {
+                    struct relocation_info output_relocation;
+
+                    output_relocation = input_section->relocations[relocation_index];
+                    output_relocation.r_address += (int32_t) offset_in_output;
+                    if (!cld_append_output_relocation(section,
+                                                      &output_relocation,
+                                                      object_index,
+                                                      error)) {
+                        goto cleanup;
+                    }
+                }
+
+                section->size = new_size;
             }
         }
+    }
+
+    startup_section_index = SIZE_MAX;
+    for (section_index = 0; section_index < output_section_count; ++section_index) {
+        if (strncmp(sections[section_index].segname, SEG_TEXT, 16) != 0) {
+            continue;
+        }
+        if (strncmp(sections[section_index].sectname, "__text", 16) != 0) {
+            continue;
+        }
+        if (sections[section_index].zero_fill) {
+            continue;
+        }
+        startup_section_index = section_index;
+        break;
+    }
+    if (startup_section_index == SIZE_MAX) {
+        cld_set_error(error, "linked output is missing a non-zerofill __TEXT,__text section for startup");
+        goto cleanup;
+    }
+
+    {
+        CldOutputSection *startup_section;
+        uint64_t startup_reserved_size;
+        uint64_t new_size;
+        uint8_t *next_contents;
+        size_t relocation_index;
+
+        startup_section = &sections[startup_section_index];
+        startup_reserved_size = startup_prologue_size + ((uint64_t) CLD_IMPORT_STUB_CAPACITY * import_stub_size);
+        new_size = startup_reserved_size + startup_section->size;
+        next_contents = realloc(startup_section->contents, (size_t) new_size);
+        if (next_contents == NULL) {
+            cld_set_error(error, "out of memory growing startup section");
+            goto cleanup;
+        }
+        if (startup_section->size != 0) {
+            memmove(next_contents + startup_reserved_size, next_contents, (size_t) startup_section->size);
+        }
+        memset(next_contents, 0, (size_t) startup_reserved_size);
+        startup_section->contents = next_contents;
+        startup_section->size = new_size;
+        startup_section->flags |= (S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS);
+        startup_section->align = (uint32_t) cld_max_u64(startup_section->align, 2);
+
+        if (startup_reserved_size > INT32_MAX) {
+            cld_set_error(error, "startup relocation offset is too large");
+            goto cleanup;
+        }
+
+        for (object_index = 0; object_index < object_count; ++object_index) {
+            const CldMachOObject *object_file;
+
+            object_file = &object_files[object_index];
+            for (section_index = 1; section_index <= object_file->section_count; ++section_index) {
+                CldSectionMapEntry *entry;
+
+                entry = &object_states[object_index].section_map[section_index];
+                if (entry->output_section_index == (uint32_t) (startup_section_index + 1)) {
+                    entry->offset_in_output += startup_reserved_size;
+                }
+            }
+        }
+
+        for (relocation_index = 0; relocation_index < startup_section->relocation_count; ++relocation_index) {
+            startup_section->owned_relocations[relocation_index].r_address += (int32_t) startup_reserved_size;
+        }
+    }
+
+    cld_trace_log("startup section prepared");
+    if (target->cpu_type == CPU_TYPE_X86_64) {
+        uint8_t *stub;
+        uint64_t exit_symbol_address;
+        const char *exit_symbol_name;
+
+        cld_trace_log("x86 startup prologue begin");
+
+        stub = sections[startup_section_index].contents;
+        exit_symbol_address = 0;
+        exit_symbol_name = "_exit";
+
+#if defined(_WIN32)
+        cld_set_error(error, "x86_64 startup symbol resolution is not supported on Windows");
+        goto cleanup;
+#else
+        if (target->cpu_type == CLD_HOST_CPU_TYPE) {
+            void *exit_ptr;
+
+            exit_ptr = dlsym(RTLD_DEFAULT, "exit");
+            if (exit_ptr == NULL) {
+                exit_ptr = dlsym(RTLD_DEFAULT, exit_symbol_name);
+            }
+            if (exit_ptr == NULL) {
+                cld_set_error(error, "unable to resolve startup symbol %s", exit_symbol_name);
+                goto cleanup;
+            }
+            exit_symbol_address = (uint64_t) (uintptr_t) exit_ptr;
+        } else if (target->cpu_type == CPU_TYPE_X86_64 && CLD_HOST_CPU_TYPE == CPU_TYPE_ARM64) {
+            cld_trace_log("x86 startup resolver call begin");
+            if (!cld_resolve_x86_64_symbol_via_rosetta(exit_symbol_name,
+                                                       "/usr/lib/libSystem.B.dylib",
+                                                       &exit_symbol_address,
+                                                       error)) {
+                goto cleanup;
+            }
+            cld_trace_log("x86 startup resolver call end");
+        } else {
+            cld_set_error(error,
+                          "x86_64 startup is unsupported for cross-arch target %s on this host",
+                          target->name);
+            goto cleanup;
+        }
+#endif
+
+        cld_trace_log("x86 startup prologue emit");
+
+        memset(stub, 0x90, (size_t) startup_prologue_size);
+        stub[0] = 0xe8;
+        cld_write_u64(stub + 1, 4, 0u);
+        stub[5] = 0x89;
+        stub[6] = 0xc7;
+        stub[7] = 0x49;
+        stub[8] = 0xbb;
+        cld_write_u64(stub + 9, 8, exit_symbol_address);
+        stub[17] = 0x41;
+        stub[18] = 0xff;
+        stub[19] = 0xd3;
+        stub[20] = 0xcc;
+    } else {
+        cld_write_u64(sections[startup_section_index].contents + 0, 4, 0x94000000u);
+        cld_write_u64(sections[startup_section_index].contents + 4, 4, 0xd2800030u);
+        cld_write_u64(sections[startup_section_index].contents + 8, 4, 0xf2a40010u);
+        cld_write_u64(sections[startup_section_index].contents + 12, 4, 0xd4001001u);
+        cld_write_u64(sections[startup_section_index].contents + 16, 4, CLD_ARM64_B_IMM26_ZERO);
     }
 
     segment_count = 0;
@@ -2607,7 +3305,7 @@ static bool cld_link_macho_arm64_executable(const CldMachOObject *object_files,
                 offset_in_section = input_symbol->raw.n_value - object_file->sections[input_symbol->raw.n_sect - 1].address;
                 resolved_symbol->is_defined = true;
                 resolved_symbol->section = (uint8_t) mapped_section->output_section_index;
-                resolved_symbol->value = output_section->address + offset_in_section;
+                resolved_symbol->value = output_section->address + mapped_section->offset_in_output + offset_in_section;
             } else if (symbol_type == N_ABS) {
                 resolved_symbol->is_defined = true;
                 resolved_symbol->value = input_symbol->raw.n_value;
@@ -2632,7 +3330,9 @@ static bool cld_link_macho_arm64_executable(const CldMachOObject *object_files,
             continue;
         }
         if (!cld_lookup_defined_symbol_by_name(symbols, total_symbol_count, symbols[symbol_index].name, true, &symbols[symbol_index].value, error) &&
-            !cld_lookup_defined_symbol_by_name(symbols, total_symbol_count, symbols[symbol_index].name, false, &symbols[symbol_index].value, error)) {
+            !cld_lookup_defined_symbol_by_name(symbols, total_symbol_count, symbols[symbol_index].name, false, &symbols[symbol_index].value, error) &&
+            !cld_lookup_defined_symbol_with_varargs_suffix(symbols, total_symbol_count, symbols[symbol_index].name, true, &symbols[symbol_index].value, error) &&
+            !cld_lookup_defined_symbol_with_varargs_suffix(symbols, total_symbol_count, symbols[symbol_index].name, false, &symbols[symbol_index].value, error)) {
             const char *cached_dylib;
             char resolved_dylib[1024];
 
@@ -2674,6 +3374,7 @@ static bool cld_link_macho_arm64_executable(const CldMachOObject *object_files,
                 goto cleanup;
             }
             symbols[symbol_index].is_dynamic_import = true;
+            symbols[symbol_index].include_in_output = true;
             continue;
         }
         symbols[symbol_index].is_defined = true;
@@ -2686,14 +3387,25 @@ static bool cld_link_macho_arm64_executable(const CldMachOObject *object_files,
             goto cleanup;
         }
     }
+    cld_trace_log("symbol resolution complete");
 
     if (!cld_lookup_defined_symbol_by_name(symbols, total_symbol_count, entry_symbol, false, &entry_value, error)) {
         cld_set_error(error, "entry symbol %s was not found in the linked objects", entry_symbol);
         goto cleanup;
     }
 
-    if (!cld_patch_branch26(sections[startup_section_index].contents, sections[startup_section_index].address, entry_value, error)) {
-        goto cleanup;
+    if (target->cpu_type == CPU_TYPE_X86_64) {
+        if (!cld_patch_x86_64_rel32(sections[startup_section_index].contents + 1,
+                                    sections[startup_section_index].address + 1,
+                                    entry_value,
+                                    0,
+                                    error)) {
+            goto cleanup;
+        }
+    } else {
+        if (!cld_patch_branch26(sections[startup_section_index].contents, sections[startup_section_index].address, entry_value, error)) {
+            goto cleanup;
+        }
     }
 
     entry_file_offset = sections[startup_section_index].file_offset;
@@ -2702,6 +3414,7 @@ static bool cld_link_macho_arm64_executable(const CldMachOObject *object_files,
                                sections,
                                output_section_count,
                                object_states,
+                               object_count,
                                symbols,
                                &sections[startup_section_index],
                                import_stub_slots,
@@ -2710,6 +3423,7 @@ static bool cld_link_macho_arm64_executable(const CldMachOObject *object_files,
                                error)) {
         goto cleanup;
     }
+    cld_trace_log("relocations applied");
 
     symtab_size = 0;
     symtab_capacity = 0;
@@ -2717,22 +3431,33 @@ static bool cld_link_macho_arm64_executable(const CldMachOObject *object_files,
     string_capacity = 0;
     local_symbol_count = 0;
     external_symbol_count = 0;
+    undefined_symbol_count = 0;
+    emitted_symbol_count = 0;
     if (!cld_append_bytes(&string_bytes, &string_size, &string_capacity, "", 1, error)) {
         goto cleanup;
     }
 
-    for (int pass = 0; pass < 2; ++pass) {
+    for (int pass = 0; pass < 3; ++pass) {
         for (symbol_index = 0; symbol_index < total_symbol_count; ++symbol_index) {
             struct nlist_64 output_symbol;
             uint32_t string_offset;
             bool is_external;
+            bool emit_now;
 
-            if (!symbols[symbol_index].include_in_output || !symbols[symbol_index].is_defined) {
+            if (!symbols[symbol_index].include_in_output) {
                 continue;
             }
 
             is_external = (symbols[symbol_index].type & N_EXT) != 0;
-            if ((pass == 0 && is_external) || (pass == 1 && !is_external)) {
+            emit_now = false;
+            if (pass == 0 && !is_external) {
+                emit_now = true;
+            } else if (pass == 1 && is_external && symbols[symbol_index].is_defined) {
+                emit_now = true;
+            } else if (pass == 2 && is_external && !symbols[symbol_index].is_defined) {
+                emit_now = true;
+            }
+            if (!emit_now) {
                 continue;
             }
 
@@ -2743,17 +3468,20 @@ static bool cld_link_macho_arm64_executable(const CldMachOObject *object_files,
 
             output_symbol.n_un.n_strx = string_offset;
             output_symbol.n_type = symbols[symbol_index].type;
-            output_symbol.n_sect = symbols[symbol_index].section;
+            output_symbol.n_sect = symbols[symbol_index].is_defined ? symbols[symbol_index].section : NO_SECT;
             output_symbol.n_desc = symbols[symbol_index].description;
-            output_symbol.n_value = symbols[symbol_index].value;
+            output_symbol.n_value = symbols[symbol_index].is_defined ? symbols[symbol_index].value : 0;
             if (!cld_append_bytes(&symtab_bytes, &symtab_size, &symtab_capacity, &output_symbol, sizeof(output_symbol), error)) {
                 goto cleanup;
             }
+            symbols[symbol_index].output_index = emitted_symbol_count++;
 
-            if (is_external) {
+            if (!is_external) {
+                ++local_symbol_count;
+            } else if (symbols[symbol_index].is_defined) {
                 ++external_symbol_count;
             } else {
-                ++local_symbol_count;
+                ++undefined_symbol_count;
             }
         }
     }
@@ -2786,7 +3514,10 @@ static bool cld_link_macho_arm64_executable(const CldMachOObject *object_files,
     header->filetype = MH_EXECUTE;
     header->ncmds = (uint32_t) command_count;
     header->sizeofcmds = (uint32_t) load_commands_size;
-    header->flags = MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_PIE;
+    header->flags = MH_DYLDLINK | MH_TWOLEVEL | MH_PIE;
+    if (undefined_symbol_count == 0) {
+        header->flags |= MH_NOUNDEFS;
+    }
     header->reserved = 0;
 
     command_cursor = output_bytes + sizeof(*header);
@@ -2891,7 +3622,7 @@ static bool cld_link_macho_arm64_executable(const CldMachOObject *object_files,
         dysymtab_command.iextdefsym = local_symbol_count;
         dysymtab_command.nextdefsym = external_symbol_count;
         dysymtab_command.iundefsym = local_symbol_count + external_symbol_count;
-        dysymtab_command.nundefsym = 0;
+        dysymtab_command.nundefsym = undefined_symbol_count;
         memcpy(command_cursor, &dysymtab_command, sizeof(dysymtab_command));
         command_cursor += sizeof(dysymtab_command);
     }
@@ -2965,19 +3696,25 @@ static bool cld_link_macho_arm64_executable(const CldMachOObject *object_files,
     if (!cld_write_entire_file(options->output_path, output_bytes, file_size, error)) {
         goto cleanup;
     }
+    cld_trace_log("output written");
 
     if (chmod(options->output_path, 0755) != 0) {
         cld_set_error(error, "linked output was written but chmod failed for %s", options->output_path);
         goto cleanup;
     }
+    cld_trace_log("chmod complete");
 
+    cld_trace_log("codesign start");
     if (!cld_run_codesign(options->output_path, error)) {
         goto cleanup;
     }
+    cld_trace_log("codesign complete");
 
+    cld_trace_log("codesign load command fixup start");
     if (!cld_fixup_codesign_load_commands(options->output_path, error)) {
         goto cleanup;
     }
+    cld_trace_log("codesign load command fixup complete");
 
     success = true;
 
@@ -2991,6 +3728,7 @@ cleanup:
     if (sections != NULL) {
         for (section_index = 0; section_index < output_section_count; ++section_index) {
             free(sections[section_index].owned_relocations);
+            free(sections[section_index].relocation_owner_objects);
             free(sections[section_index].contents);
         }
     }
@@ -3024,14 +3762,13 @@ bool cld_link_objects(const CldMachOObject *object_files, size_t object_count, c
     }
 
     if (options->target->object_format == CLD_OBJECT_FORMAT_ELF) {
-        cld_set_error(error,
-                      "self-hosted ELF linking is not implemented for target %s (external compiler/linker fallback is disabled)",
-                      options->target->name);
-        return false;
+        return cld_link_elf_like_objects(object_files, object_count, options, error);
     }
 
     if (options->output_kind == CLD_OUTPUT_KIND_RELOCATABLE) {
-        if (options->target->cpu_type != CPU_TYPE_ARM64 || options->target->platform != PLATFORM_MACOS) {
+        if ((options->target->cpu_type != CPU_TYPE_ARM64 &&
+             options->target->cpu_type != CPU_TYPE_X86_64) ||
+            options->target->platform != PLATFORM_MACOS) {
             cld_set_error(error, "relocatable emission is not implemented for target %s", options->target->name);
             return false;
         }
@@ -3039,7 +3776,9 @@ bool cld_link_objects(const CldMachOObject *object_files, size_t object_count, c
     }
 
     if (options->output_kind == CLD_OUTPUT_KIND_EXECUTABLE) {
-        if (options->target->cpu_type != CPU_TYPE_ARM64 || options->target->platform != PLATFORM_MACOS) {
+        if ((options->target->cpu_type != CPU_TYPE_ARM64 &&
+             options->target->cpu_type != CPU_TYPE_X86_64) ||
+            options->target->platform != PLATFORM_MACOS) {
             cld_set_error(error, "executable emission is not implemented for target %s", options->target->name);
             return false;
         }

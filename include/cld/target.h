@@ -29,7 +29,10 @@ typedef struct {
 } CldTarget;
 
 extern const CldTarget cld_target_macos_arm64;
+extern const CldTarget cld_target_macos_x86_64;
 extern const CldTarget cld_target_x86_64_elf;
+extern const CldTarget cld_target_arm64_elf;
+extern const CldTarget cld_target_arm64_windows;
 extern const CldTarget cld_target_bslash;
 
 const CldTarget *cld_default_target(void);

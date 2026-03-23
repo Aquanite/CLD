@@ -61,11 +61,14 @@ bool cld_parse_macho_object(const char *path, CldMachOObject *object_file, CldEr
         return false;
     }
 
-    if (header->cputype != CPU_TYPE_ARM64) {
-        cld_set_error(error, "%s is not an arm64 object file", path);
+    if (header->cputype != CPU_TYPE_ARM64 && header->cputype != CPU_TYPE_X86_64) {
+        cld_set_error(error, "%s is not an arm64/x86_64 object file", path);
         cld_free_macho_object(object_file);
         return false;
     }
+
+    object_file->cputype = header->cputype;
+    object_file->cpusubtype = header->cpusubtype;
 
     object_file->header_flags = header->flags;
 

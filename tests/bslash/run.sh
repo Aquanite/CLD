@@ -16,12 +16,16 @@ fi
 ./build/bso_fixture emit-target build/bslash-target.bso
 ./build/bso_fixture emit-dup-a build/bslash-dup-a.bso
 ./build/bso_fixture emit-dup-b build/bslash-dup-b.bso
+./build/bso_fixture emit-cld-end-ref build/bslash-cld-end-ref.bso
 
 ./build/cld link build/bslash-ref.bso build/bslash-target.bso -o build/bslash-merged.bso --output-kind relocatable --target bslash
 ./build/bso_fixture check-merged build/bslash-merged.bso
 
 ./build/cld link build/bslash-ref.bso build/bslash-target.bso -o build/bslash.bin --output-kind executable --target bslash
 ./build/bso_fixture check-bin build/bslash.bin
+
+./build/cld link build/bslash-cld-end-ref.bso build/bslash-target.bso -o build/bslash-cld-end.bin --output-kind executable --target bslash
+./build/bso_fixture check-cld-end-bin build/bslash-cld-end.bin
 
 if ./build/cld link build/bslash-ref.bso -o build/bslash-unresolved.bin --output-kind executable --target bslash >build/bslash-unresolved.stdout 2>build/bslash-unresolved.stderr; then
 	echo "expected unresolved BSlash link to fail" >&2

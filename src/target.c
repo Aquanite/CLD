@@ -5,7 +5,10 @@
 
 static const CldTarget *const cld_targets[] = {
     &cld_target_macos_arm64,
+    &cld_target_macos_x86_64,
     &cld_target_x86_64_elf,
+    &cld_target_arm64_elf,
+    &cld_target_arm64_windows,
     &cld_target_bslash,
 };
 
