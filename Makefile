@@ -2,17 +2,19 @@ CC := clang
 CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -O2 -Iinclude -MMD -MP
 LDFLAGS :=
 BUILD_DIR := build
-TARGET := $(BUILD_DIR)/cld
-TARGET_EXE := $(TARGET).exe
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 DESTDIR ?=
+EXE_SUFFIX :=
 BIN_NAME := cld
 
 ifeq ($(OS),Windows_NT)
+EXE_SUFFIX := .exe
 BIN_NAME := cld.exe
 endif
 
+TARGET := $(BUILD_DIR)/cld$(EXE_SUFFIX)
+BIN_DIR_FINAL := $(DESTDIR)$(BINDIR)
 SOURCES := $(wildcard src/*.c)
 OBJECTS := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SOURCES))
 DEPS := $(OBJECTS:.o=.d)
@@ -22,15 +24,16 @@ DEPS := $(OBJECTS:.o=.d)
 all: $(TARGET)
 
 $(TARGET): $(OBJECTS)
-	@mkdir -p $(BUILD_DIR)
+	@-mkdir "$(BUILD_DIR)"
 	$(CC) $(OBJECTS) $(LDFLAGS) -o $@
 
 $(BUILD_DIR)/%.o: src/%.c
-	@mkdir -p $(BUILD_DIR)
+	@-mkdir "$(BUILD_DIR)"
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -rf $(BUILD_DIR)
+	-rm -rf "$(BUILD_DIR)"
+	-rmdir /S /Q "$(BUILD_DIR)"
 
 test: $(TARGET)
 	./tests/macos/run.sh
@@ -38,17 +41,19 @@ test: $(TARGET)
 	./tests/bslash/run.sh
 
 install: $(TARGET)
-	install -d "$(DESTDIR)$(BINDIR)"
-	@if [ -f "$(TARGET)" ]; then \
-		install -m 755 "$(TARGET)" "$(DESTDIR)$(BINDIR)/$(BIN_NAME)"; \
-	elif [ -f "$(TARGET_EXE)" ]; then \
-		install -m 755 "$(TARGET_EXE)" "$(DESTDIR)$(BINDIR)/$(BIN_NAME)"; \
-	else \
-		echo "missing build target: $(TARGET) or $(TARGET_EXE)"; \
-		exit 1; \
-	fi
+ifeq ($(OS),Windows_NT)
+	@-mkdir "$(BIN_DIR_FINAL)"
+	copy /Y "$(TARGET)" "$(BIN_DIR_FINAL)\\$(BIN_NAME)" >nul
+else
+	install -d "$(BIN_DIR_FINAL)"
+	install -m 755 "$(TARGET)" "$(BIN_DIR_FINAL)/$(BIN_NAME)"
+endif
 
 uninstall:
-	rm -f "$(DESTDIR)$(BINDIR)/$(BIN_NAME)"
+ifeq ($(OS),Windows_NT)
+	-del /Q "$(BIN_DIR_FINAL)\\$(BIN_NAME)"
+else
+	rm -f "$(BIN_DIR_FINAL)/$(BIN_NAME)"
+endif
 
 -include $(DEPS)
