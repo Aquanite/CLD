@@ -1,10 +1,6 @@
 #include "cld/linker.h"
 
-#include <mach-o/arm64/reloc.h>
-#include <mach-o/x86_64/reloc.h>
-#include <mach-o/loader.h>
-#include <mach-o/nlist.h>
-#include <mach/machine.h>
+#include "cld/macho_compat.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>

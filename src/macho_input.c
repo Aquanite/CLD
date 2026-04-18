@@ -1,8 +1,7 @@
 #include "cld/macho.h"
 
-#include <mach-o/loader.h>
-#include <mach-o/nlist.h>
-#include <mach/machine.h>
+#include "cld/macho_compat.h"
+
 #include <stdlib.h>
 #include <string.h>
 

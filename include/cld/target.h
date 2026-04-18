@@ -2,9 +2,10 @@
 #define CLD_TARGET_H
 
 #include <stdbool.h>
-#include <mach-o/loader.h>
 #include <stddef.h>
 #include <stdint.h>
+
+#include "cld/macho_compat.h"
 
 typedef enum {
     CLD_OBJECT_FORMAT_MACHO,

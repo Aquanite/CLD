@@ -1,8 +1,7 @@
 #include "cld/bso.h"
 
-#include <mach-o/loader.h>
-#include <mach-o/nlist.h>
-#include <mach-o/reloc.h>
+#include "cld/macho_compat.h"
+
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>

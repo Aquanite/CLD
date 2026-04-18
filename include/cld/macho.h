@@ -1,9 +1,7 @@
 #ifndef CLD_MACHO_H
 #define CLD_MACHO_H
 
-#include <mach-o/loader.h>
-#include <mach-o/nlist.h>
-#include <mach-o/reloc.h>
+#include "cld/macho_compat.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>

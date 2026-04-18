@@ -3,9 +3,16 @@ CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -O2 -Iinclude -MMD -MP
 LDFLAGS :=
 BUILD_DIR := build
 TARGET := $(BUILD_DIR)/cld
+TARGET_EXE := $(TARGET).exe
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 DESTDIR ?=
+BIN_NAME := cld
+
+ifeq ($(OS),Windows_NT)
+BIN_NAME := cld.exe
+endif
+
 SOURCES := $(wildcard src/*.c)
 OBJECTS := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SOURCES))
 DEPS := $(OBJECTS:.o=.d)
@@ -32,9 +39,16 @@ test: $(TARGET)
 
 install: $(TARGET)
 	install -d "$(DESTDIR)$(BINDIR)"
-	install -m 755 "$(TARGET)" "$(DESTDIR)$(BINDIR)/cld"
+	@if [ -f "$(TARGET)" ]; then \
+		install -m 755 "$(TARGET)" "$(DESTDIR)$(BINDIR)/$(BIN_NAME)"; \
+	elif [ -f "$(TARGET_EXE)" ]; then \
+		install -m 755 "$(TARGET_EXE)" "$(DESTDIR)$(BINDIR)/$(BIN_NAME)"; \
+	else \
+		echo "missing build target: $(TARGET) or $(TARGET_EXE)"; \
+		exit 1; \
+	fi
 
 uninstall:
-	rm -f "$(DESTDIR)$(BINDIR)/cld"
+	rm -f "$(DESTDIR)$(BINDIR)/$(BIN_NAME)"
 
 -include $(DEPS)
