@@ -45,6 +45,7 @@ typedef struct {
 
 #define CLD_BSLASH_DEFAULT_IMAGE_BASE 0xA0000000ull
 #define CLD_BSLASH_SYNTHETIC_END_SYMBOL "_cld_end"
+#define CLD_BSO_OBJECT_ALIGNMENT 8u
 
 const CldTarget cld_target_bslash = {
     .name = "bslash",
@@ -228,6 +229,21 @@ static size_t cld_bso_find_object_with_symbol(const CldBsoObject *object_files,
     return SIZE_MAX;
 }
 
+static size_t cld_bso_align_up_size(size_t value, size_t alignment) {
+    size_t remainder;
+
+    if (alignment == 0) {
+        return value;
+    }
+
+    remainder = value % alignment;
+    if (remainder == 0) {
+        return value;
+    }
+
+    return value + (alignment - remainder);
+}
+
 static bool cld_bso_collect_objects(const CldBsoObject *object_files,
                                     size_t object_count,
                                     size_t preferred_first_object,
@@ -282,9 +298,29 @@ static bool cld_bso_collect_objects(const CldBsoObject *object_files,
         const CldBsoObject *object_file;
         size_t input_symbol_index;
         size_t source_index;
+        size_t aligned_contents_size;
 
         source_index = object_order != NULL ? object_order[object_index] : object_index;
         object_file = &object_files[source_index];
+
+        aligned_contents_size = cld_bso_align_up_size(contents_size, CLD_BSO_OBJECT_ALIGNMENT);
+        if (aligned_contents_size < contents_size) {
+            cld_set_error(error, "BSO output exceeds addressable size");
+            goto failure;
+        }
+        if (aligned_contents_size != contents_size) {
+            uint8_t *grown;
+
+            grown = realloc(contents, aligned_contents_size);
+            if (grown == NULL) {
+                cld_set_error(error, "out of memory growing BSO output image");
+                goto failure;
+            }
+            contents = grown;
+            memset(contents + contents_size, 0, aligned_contents_size - contents_size);
+            contents_size = aligned_contents_size;
+        }
+
         if (contents_size > SIZE_MAX - object_file->code_size) {
             cld_set_error(error, "BSO output exceeds addressable size");
             goto failure;
